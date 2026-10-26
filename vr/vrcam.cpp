@@ -412,6 +412,7 @@ struct Settings {
     std::atomic<bool>  flatBodyPickThird{true};   // [input] flat_body_pick_third: the same aim in flat third person
     std::atomic<int>   portalFace{1};   // [input] portal_face: the portal's black centre (vr/portal_hole.h), F2/F3 only: 0 the game's, 1 not built, 2 built under an empty name
     std::atomic<bool>  npcLookHorizon{true};  // [input] npc_look_horizon: flat F3, aim look from MonStats height when an NPC's dialogue opens
+    std::atomic<float> npcFaceY{0.30f};       // [input] npc_face_y: where the NPC's face is put on the screen then (0 top .. 1 bottom)
     std::atomic<bool>  portalAxis{false};  // [input] portal_axis: effects are born facing the old 45 degree camera; the picture stays
     std::atomic<bool>  findPrevMatrix{false};
     std::atomic<bool>  dlssPrevFix{false};
@@ -2032,6 +2033,7 @@ void LoadSettings() {
     g_set.flatBodyPickThird.store(IniB(L"input", L"flat_body_pick_third", true));
     g_set.portalFace.store(std::clamp((int)IniF(L"input", L"portal_face", 1.0f), 0, 2));
     g_set.npcLookHorizon.store(IniB(L"input", L"npc_look_horizon", true));
+    g_set.npcFaceY.store(std::clamp(IniF(L"input", L"npc_face_y", 0.30f), 0.05f, 0.60f));
     // [input] flat_iso_ray: the game's ground test gets the old isometric camera's ray through the point meant (vr/flat_pick.h);
     // [debug] flat_elev: the look-at's frame (grid or render) and the rays' callers in the log. Both need flat_body_pick(_third) on.
     flatpick::SetModes(IniB(L"input", L"flat_iso_ray", true), IniB(L"debug", L"flat_elev", false));
@@ -2462,6 +2464,9 @@ bool ReloadIfChanged() {
 // State
 std::atomic<bool> g_enabled{false};
 std::atomic<float> g_mouseYaw{0.0f}, g_mousePitch{0.0f};   // the mouse's turn on top of the head (deg)
+// The unit the game found under the pointer at the last mouse click (HookMapClick, flat) and when: who an NPC dialogue is with.
+std::atomic<uintptr_t> g_clickUnit{0};
+std::atomic<ULONGLONG> g_clickUnitAt{0};
 std::atomic<float> g_recenter{0.0f};    // head yaw that counts as straight ahead
 std::atomic<float> g_recenterPitch{0.0f}; // head pitch that counts as level (F11)
 std::atomic<float> g_recenterRoll{0.0f};  // head roll that counts as upright (F11)
@@ -3326,24 +3331,41 @@ void VrFrame() {
         if (npc && !wasNpc && haveLook) {
             float pitch = 0.0f;
             float nx = 0, ny = 0, nz = 0, nh = 0;
-            const uintptr_t unit = flatpick::NearestMonster(look[0], look[1], look[2], 14.0f);
-            if (unit && flatpick::MonsterPose(unit, look[1], &nx, &ny, &nz, &nh)) {
-                const float eyeY = look[1] + ViewHeight() + JumpLift();
-                // Upper chest / neck: aiming here with a small upward clear leaves the head
-                // below screen centre so the dialogue sits in the sky for short and tall NPCs.
-                const float aimY = ny + nh * 0.70f;
+            uint32_t cls = 0;
+            // Who the dialogue is with: the unit the game found under the pointer at the click that opened it (a mercenary or a
+            // minion standing nearer is not it); the nearest one only when there was no such click.
+            uintptr_t unit = g_clickUnit.load();
+            const bool clicked = unit && GetTickCount64() - g_clickUnitAt.load() < 30000;
+            if (!(clicked && flatpick::MonsterPose(unit, look[1], &nx, &ny, &nz, &nh, &cls)))
+                unit = flatpick::NearestMonster(look[0], look[1], look[2], 14.0f);
+            if (unit && flatpick::MonsterPose(unit, look[1], &nx, &ny, &nz, &nh, &cls)) {
                 constexpr float kShear = 1.22474487139f;   // the look-at is the render point of the hero, the NPC's place the grid's (flat_elev, 2026-10-24)
+                constexpr float kRad = 3.14159265f / 180.0f;
+                const float eyeY = look[1] + ViewHeight() + JumpLift();
+                const float faceY = ny + nh * 0.90f;
                 const float dx = nx - (look[0] - look[1] * kShear), dz = nz - (look[2] - look[1] * kShear);
                 float horiz = sqrtf(dx * dx + dz * dz);
-                if (horiz < 0.75f) horiz = 0.75f;
-                const float downDeg = atan2f(eyeY - aimY, horiz) * (180.0f / 3.14159265f);
-                constexpr float kClearDeg = 8.0f;
-                constexpr float kLowerDeg = 6.0f;  // same extra look-down for every NPC
-                pitch = std::clamp(downDeg - kClearDeg + kLowerDeg, -40.0f, 40.0f);
-                char b[160];
+                // Depth along the view's horizontal heading: the sideways part does not enter the picture's height.
+                float depth = horiz;
+                AcquireSRWLockShared(&g_stickLock); const StickFrame sf = g_stickFrame; ReleaseSRWLockShared(&g_stickLock);
+                if (sf.valid) {
+                    const float fl = sqrtf(sf.camF[0] * sf.camF[0] + sf.camF[2] * sf.camF[2]);
+                    if (fl > 0.1f) depth = (dx * sf.camF[0] + dz * sf.camF[2]) / fl;
+                }
+                if (depth < 0.5f) depth = horiz;
+                if (depth < 0.75f) depth = 0.75f;
+                // The face is an angle below the horizon by a = atan(drop / depth); the view's axis, pitched p down, puts it at height
+                // ndc = tan(p - a) / tan(fov/2) (+1 top). So the face lands at npc_face_y of the screen when p = a + atan(ndc * tan(fov/2)).
+                const float sy = g_projSy.load();
+                const float tanHalf = sy > 0.1f ? 1.0f / sy : tanf(0.5f * CameraFov() * kRad);
+                const float ndc = 1.0f - 2.0f * g_set.npcFaceY.load();
+                const float a = atan2f(eyeY - faceY, depth);
+                const float downDeg = (a + atanf(ndc * tanHalf)) / kRad;
+                pitch = std::clamp(downDeg, -40.0f, 40.0f);
+                char b[200];
                 snprintf(b, sizeof b,
-                         "vrcam: flat FPP - NPC dialogue look pitch %.1f (MonStats h=%.1f, horiz=%.1f) ([input] npc_look_horizon)",
-                         pitch, nh, horiz);
+                         "vrcam: flat FPP - NPC dialogue look pitch %.1f (class %u, %s, MonStats h=%.1f, depth=%.1f, face at %.0f%% of the screen) ([input] npc_look_horizon)",
+                         pitch, cls, clicked ? "clicked" : "nearest", nh, depth, g_set.npcFaceY.load() * 100.0f);
                 Log(b);
             } else {
                 pitch = 6.0f;  // same lower look when MonStats pose is missing
@@ -6382,13 +6404,23 @@ uint64_t HookMapClick(void* unit, int type, int x, int y, uint64_t flags) {
     const bool mouseType = type == 0 || type == 1 || type == 3 || type == 4;
     // nothing under the pointer? the game's own lookup (HoverUnit), asked once for whoever needs it
     int bareKnown = -1;
+    void* hovered = nullptr;
     auto bare = [&]() {
         if (bareKnown < 0) {
             const int idx = ((ClientIndexFn)d2rsig::Addr(RVA_CLIENT_INDEX))(unit);
-            bareKnown = idx >= 0 && idx < 8 && !((HoverUnitFn)d2rsig::Addr(RVA_HOVER_UNIT))(idx) ? 1 : 0;
+            if (idx >= 0 && idx < 8) hovered = ((HoverUnitFn)d2rsig::Addr(RVA_HOVER_UNIT))(idx);
+            bareKnown = idx >= 0 && idx < 8 && !hovered ? 1 : 0;
         }
         return bareKnown == 1;
     };
+    // flat, the NPC dialogue's look (VrFrame): who the click found under the pointer
+    if (unit && mouseType && !(flags & 0xFF) && g_set.platform.load() == 0 && g_set.npcLookHorizon.load() && KeyMoveMode() && ShooterActive()) {
+        bare();
+        if (hovered && *static_cast<const uint32_t*>(hovered) == 1) {   // unit type 1: monster / NPC
+            g_clickUnit.store(reinterpret_cast<uintptr_t>(hovered));
+            g_clickUnitAt.store(GetTickCount64());
+        }
+    }
     if (unit && mouseType && !(flags & 0xFF)) {
         const bool shooter = g_set.flatClickShoot.load() && KeyMoveMode() && ShooterActive();
         // VR first person ([gameplay] attack_in_place): a click on bare ground - from a mouse, the laser or a program - is a skill in

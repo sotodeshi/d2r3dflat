@@ -37,7 +37,8 @@ void SetHoverProbe(bool (*fn)(bool* hovered, uint32_t* type, uint32_t* cls));
 
 // Live monster/NPC: ground place and MonStats body height (world units).
 // floorY is the feet height (hero ground). false if not a monster or unread.
-bool MonsterPose(uintptr_t unit, float floorY, float* x, float* y, float* z, float* height);
+// cls (optional): the unit's class, to tell the unit meant from another that took its memory.
+bool MonsterPose(uintptr_t unit, float floorY, float* x, float* y, float* z, float* height, uint32_t* cls = nullptr);
 
 // Nearest live monster/NPC within reach of look-at (hx,hz); hy kept for call-site symmetry.
 uintptr_t NearestMonster(float hx, float hy, float hz, float reach);

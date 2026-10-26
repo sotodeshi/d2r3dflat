@@ -644,7 +644,7 @@ void HoverWatch() {
 
 bool ElevOn() { return g_elev.load(std::memory_order_relaxed); }
 
-bool MonsterPose(uintptr_t unit, float floorY, float* x, float* y, float* z, float* height) {
+bool MonsterPose(uintptr_t unit, float floorY, float* x, float* y, float* z, float* height, uint32_t* cls) {
     if (!unit || !x || !y || !z || !height || !std::isfinite(floorY)) return false;
     unitscan::Unit u{};
     if (!ReadMem(u.b, unit, sizeof u.b)) return false;
@@ -661,6 +661,7 @@ bool MonsterPose(uintptr_t unit, float floorY, float* x, float* y, float* z, flo
     *x = px;
     *y = floorY;
     *z = pz;
+    if (cls) *cls = unitscan::Field32(u, unitscan::kOffClass);
     return std::isfinite(*x + *y + *z + *height) && *height > 0.5f;
 }
 
