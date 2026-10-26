@@ -114,8 +114,12 @@ Szczegóły i powód są w `CHANGES.md`. Krótko:
     Test 2026-10-19: pierścień i czary i tak nie czytają tego quata. `AimPortal` usunięty.
 12. Lista nowych kluczy ini (flat): `INI_ADDED.md`. Hipoteza schodów / NPC na podestach:
     shear izometryczny `grid + height*√(3/2)` w XZ (`melee_bodies.h`) — nie `portal_axis`.
-13. v15 shear w `flat_pick` **cofnięty** (v16): LookAt≠poza F4; absolutny shear psuł hover/label.
-    Log znowu bez `(ground shear)`.
+13. v15 był błędny w wniosku, nie w pomyśle: LookAt jest punktem RENDERU (`L − Place = L.y·k`, zmierzone
+    2026-10-26 przez `[debug] flat_elev`). Naprawione w v17: kapsuły w `grid + y·k`, zasięg od siatki bohatera,
+    promień izometryczny `[input] flat_iso_ray=1` (domyślnie 1). Potwierdzone w grze: obiekty zaznaczają się
+    na każdej wysokości, czary kierunkowe i obszarowe idą pod celownik (CHANGES.md pkt 8).
+14. Otwarte: kapsuła Tyraela w Fortecy Pandemonium (akt 4) jest przesunięta — trzeba celować nieco na prawo od
+    niego i w stopy.
 
 ## Próby, które nie weszły
 

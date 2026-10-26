@@ -397,7 +397,7 @@ void __fastcall HookScreenToRay(void* cam, const float* px, float* origin, float
 		return;
 	}
 	if (const RayAdjustFn adjust = g_rayAdjust.load(std::memory_order_relaxed)) {
-		adjust(origin, dir);
+		adjust(origin, dir, px, vpW, vpH, ret);
 	}
 }
 
@@ -522,6 +522,37 @@ bool PickRay(float sx, float sy, float origin[3], float dir[3]) {
 		return false;
 	}
 	return m4::RayThrough(f.invView, f.proj, At<float>(f.cam, camf::ViewportW), At<float>(f.cam, camf::ViewportH), sx, sy, origin, dir);
+}
+
+bool ViewportNow(float* w, float* h) {
+	if (!InWorld() || Current().cam == nullptr) {
+		return false;
+	}
+	*w = At<float>(Current().cam, camf::ViewportW);
+	*h = At<float>(Current().cam, camf::ViewportH);
+	return *w > 0.0f && *h > 0.0f;
+}
+
+bool WorldToScreen(const float p[3], float* sx, float* sy) {
+	float vw = 0.0f, vh = 0.0f;
+	if (!ViewportNow(&vw, &vh)) {
+		return false;
+	}
+	const Frame& f = Current();
+	const float in[4] { p[0], p[1], p[2], 1.0f };
+	float v[4], c[4];
+	for (int j = 0; j < 4; ++j) {
+		v[j] = in[0] * f.view[0 * 4 + j] + in[1] * f.view[1 * 4 + j] + in[2] * f.view[2 * 4 + j] + in[3] * f.view[3 * 4 + j];
+	}
+	for (int j = 0; j < 4; ++j) {
+		c[j] = v[0] * f.proj[0 * 4 + j] + v[1] * f.proj[1 * 4 + j] + v[2] * f.proj[2 * 4 + j] + v[3] * f.proj[3 * 4 + j];
+	}
+	if (!(c[3] > 1.0e-4f)) {   // behind the lens
+		return false;
+	}
+	*sx = (c[0] / c[3] * 0.5f + 0.5f) * vw;
+	*sy = (0.5f - c[1] / c[3] * 0.5f) * vh;
+	return true;
 }
 
 void SetRenderRadius(int rooms) { drawdist::SetRadius(rooms); }

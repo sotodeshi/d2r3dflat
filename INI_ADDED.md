@@ -13,6 +13,8 @@ for `[mode] platform=0` (monitor). Live file: `d2r_vr.ini` (copy under
 | `[input]` | `portal_face` | `1` | F2/F3: hide portal black centre mesh (`0` game / `1` collapse / `2` empty name). Not F1. |
 | `[input]` | `portal_axis` | `0` | Test only: effects born from fixed 45° camera quat. Leave `0` (did nothing useful 2026-10-19). |
 | `[input]` | `npc_look_horizon` | `1` | F3: on NPC dialogue, set look pitch from nearest MonStats height (+6°). |
+| `[input]` | `flat_iso_ray` | `1` | Confirmed 2026-10-26: game's ground test gets the isometric ray `-(k,1,k)` through the body's feet / the crosshair's floor point (elevation fix, stage 1). Needs `flat_body_pick(_third)`. |
+| `[debug]` | `flat_elev` | `0` | Log every 2 s: look-at vs hero path place (grid or render frame?), ray callers (RVAs), adjust counters. Read only. |
 
 ## Value changes (key already existed upstream)
 
@@ -39,6 +41,10 @@ These were already in stock `d2r_vr.ini`; this build relies on them for monitor 
 
 No new ini key for: sky `VrSkyAct` (effect + DLL), `UiMaskSolid` (effect + DLL),
 Y-slack on capsules (removed), portal ring shader cover (abandoned).
+
+> **Status 2026-10-26: rozwiązane dla zaznaczania i rzucania** (CHANGES.md pkt 8). Zmierzone: LookAt jest
+> punktem renderu (`L − Place = L.y·k`); kapsuły w `grid + y·k`; promień dla gry idzie wzdłuż `−(k,1,k)`
+> (`flat_iso_ray`). Poniżej pierwotna analiza; zdanie, że „absolutny shear w flat_pick był zły”, jest nieaktualne.
 
 ## Elevation: horizontal shear (stairs / raised pads)
 

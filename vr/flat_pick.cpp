@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "d2rcam.h"
 #include "flat_pick.h"
 #include "sigscan.h"
 #include "unit_scan.h"
@@ -40,10 +41,40 @@ struct Snap {
     Cap c[kCap]{};
     int nBody = 0;                 // bodies in c[0, nBody)
     int nObj = 0;                  // objects in c[kBodyCap, kBodyCap + nObj)
+    bool hero = false;             // heroY below is this frame's look-at height
+    float heroY = 0;
 };
 Snap g_snap[2];
 std::atomic<int> g_published{0};
 bool g_toldOn = false, g_toldMiss = false;
+
+// The renderer's ground shear (melee_bodies.h kGroundShear): render = (gx + h*k, h, gz + h*k). (k, 1, k) is
+// the old isometric camera's line of sight, 30 degrees down along the diagonal.
+constexpr float kShear = 1.22474487139f;
+constexpr float kIsoLen = 2.0f;            // |(k, 1, k)| = sqrt(2 * 1.5 + 1)
+constexpr float kIsoAbove = 100.0f;        // the isometric ray starts this high over the point (and over y = 0)
+constexpr float kGroundReach = 200.0f;     // a crosshair ray meeting the floor farther than this is left alone
+constexpr float kCentreTol = 0.02f;        // the crosshair pixel: within 2% of the half viewport of the middle
+
+std::atomic<bool> g_iso{false}, g_elev{false};
+
+// [debug] flat_elev counters, written from whatever thread asks for a ray, read and reset by Refresh's log.
+constexpr int kCallerSlots = 8;
+std::atomic<uintptr_t> g_callerRva[kCallerSlots]{};
+std::atomic<uint32_t> g_callerN[kCallerSlots]{}, g_callerCentre[kCallerSlots]{};
+std::atomic<uint32_t> g_nFeet{0}, g_nIsoBody{0}, g_nIsoGround{0}, g_nGroundMiss{0};
+
+void CountCaller(uintptr_t rva, bool centre) {
+    for (int i = 0; i < kCallerSlots; ++i) {
+        uintptr_t have = g_callerRva[i].load(std::memory_order_relaxed);
+        if (have == 0 && g_callerRva[i].compare_exchange_strong(have, rva)) have = rva;
+        if (have == rva) {
+            g_callerN[i].fetch_add(1, std::memory_order_relaxed);
+            if (centre) g_callerCentre[i].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
 
 struct Row {
     uint32_t cls = 0xFFFFFFFFu;
@@ -216,15 +247,156 @@ void AimFeet(float o[3], float d[3], const Cap& c) {
     d[2] = v[2] / len;
 }
 
+// The isometric ray through render point p: along -(k, 1, k), from high over p and over y = 0. Every point of it
+// has the grid place GridPlane(p) = (p.x - p.y * k, p.z - p.y * k).
+void IsoRay(float o[3], float d[3], const float p[3]) {
+    const float lift = (p[1] < 0.0f ? -p[1] : 0.0f) + kIsoAbove;   // how far up the origin is over p
+    o[0] = p[0] + lift * kShear;
+    o[1] = p[1] + lift;
+    o[2] = p[2] + lift * kShear;
+    d[0] = -kShear / kIsoLen;
+    d[1] = -1.0f / kIsoLen;
+    d[2] = -kShear / kIsoLen;
+}
+
+bool AtCentre(const float px[2], float vpW, float vpH) {
+    if (!px || !(vpW > 0.0f) || !(vpH > 0.0f)) return false;
+    return fabsf(2.0f * px[0] / vpW - 1.0f) <= kCentreTol && fabsf(2.0f * px[1] / vpH - 1.0f) <= kCentreTol;
+}
+
+// [debug] flat_elev: is the camera's look-at on the grid (the path's place) or sheared by its height? Once every
+// kElevMs: the look-at L, the hero's path place P (the player unit nearest L), r = L - P on the ground and
+// L.y * k beside it. r ~ 0: the look-at is on the grid; r ~ (L.y * k, L.y * k): it is the render point.
+// Then who asked for rays in that time (the game's return RVAs) and what the adjust did.
+constexpr uint64_t kElevMs = 2000;
+
+// [debug] flat_elev: where the nearest bodies and objects are on the screen, and what floor the crosshair says each stands on.
+// base0: the capsule's feet as the code first placed them (the grid place at the hero's floor, unsheared); base: sheared by that floor
+// (where the test now puts them). The unit's own floor: its upright axis in the render world is the line (gx + h*k, h, gz + h*k); h where
+// the crosshair's ray passes nearest to it is the floor the unit stands on if the crosshair is on its feet (miss = how near, units).
+void TargetsLog(const Snap& s, float hx, float hy, float hz) {
+    float vw = 0, vh = 0, o[3], d[3];
+    if (!d2rcam::ViewportNow(&vw, &vh) || !d2rcam::PickRay(vw * 0.5f, vh * 0.5f, o, d)) {
+        g_log("flat elev: targets - no camera ray");
+        return;
+    }
+    const float gx = hx - hy * kShear, gz = hz - hy * kShear;
+    int idx[4] = {-1, -1, -1, -1};   // the nearest two bodies, the nearest two objects
+    float dist[4] = {1e30f, 1e30f, 1e30f, 1e30f};
+    auto offer = [&](int i, int slot) {
+        const float ex = s.c[i].x - gx, ez = s.c[i].z - gz, e = ex * ex + ez * ez;
+        if (e < dist[slot]) {
+            dist[slot + 1] = dist[slot];
+            idx[slot + 1] = idx[slot];
+            dist[slot] = e;
+            idx[slot] = i;
+        } else if (e < dist[slot + 1]) {
+            dist[slot + 1] = e;
+            idx[slot + 1] = i;
+        }
+    };
+    for (int i = 0; i < s.nBody; ++i) offer(i, 0);
+    for (int i = 0; i < s.nObj; ++i) offer(kBodyCap + i, 2);
+    char b[420];
+    snprintf(b, sizeof b, "flat elev: targets - crosshair ray from (%.1f, %.1f, %.1f) dir (%.3f, %.3f, %.3f), viewport %.0fx%.0f, hero grid (%.1f, %.1f) floor %.2f",
+             o[0], o[1], o[2], d[0], d[1], d[2], vw, vh, gx, gz, hy);
+    g_log(b);
+    for (int n = 0; n < 4; ++n) {
+        if (idx[n] < 0) continue;
+        const Cap& c = s.c[idx[n]];
+        float x0 = -1, y0 = -1, x1 = -1, y1 = -1, x2 = -1, y2 = -1;
+        const float p0[3] = {c.x, hy, c.z};
+        const float p1[3] = {c.x + hy * kShear, hy, c.z + hy * kShear};
+        const float p2[3] = {p1[0], hy + c.height, p1[2]};
+        const bool v0 = d2rcam::WorldToScreen(p0, &x0, &y0), v1 = d2rcam::WorldToScreen(p1, &x1, &y1), v2 = d2rcam::WorldToScreen(p2, &x2, &y2);
+        // the axis nearest to the crosshair's ray
+        const float u[3] = {kShear, 1.0f, kShear}, a0[3] = {c.x, 0.0f, c.z}, w[3] = {a0[0] - o[0], a0[1] - o[1], a0[2] - o[2]};
+        const float a = u[0] * u[0] + u[1] * u[1] + u[2] * u[2], bb = u[0] * d[0] + u[1] * d[1] + u[2] * d[2];
+        const float dd = u[0] * w[0] + u[1] * w[1] + u[2] * w[2], e = d[0] * w[0] + d[1] * w[1] + d[2] * w[2];
+        const float den = a - bb * bb;
+        char axis[120] = "axis parallel to the ray";
+        if (den > 1e-3f * a) {
+            const float h = (bb * e - dd) / den, t = e + bb * h;
+            const float q[3] = {a0[0] + h * u[0] - o[0] - t * d[0], h - o[1] - t * d[1], a0[2] + h * u[2] - o[2] - t * d[2]};
+            snprintf(axis, sizeof axis, "crosshair-axis floor h = %.2f (%+.2f over the hero's), miss %.2f", h, h - hy, sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]));
+        }
+        snprintf(b, sizeof b, "flat elev: targets - %s grid (%.1f, %.1f) %.1f away, height %.1f radius %.1f: base0 px (%.0f, %.0f)%s, base px (%.0f, %.0f)%s, top px (%.0f, %.0f)%s; %s",
+                 n < 2 ? "body" : "object", c.x, c.z, sqrtf(dist[n]), c.height, c.radius, x0, y0, v0 ? "" : " BEHIND", x1, y1, v1 ? "" : " BEHIND", x2, y2,
+                 v2 ? "" : " BEHIND", axis);
+        g_log(b);
+    }
+}
+
+void ElevLog(const Snap& snap, float hx, float hy, float hz, uintptr_t table) {
+    static ULONGLONG lastAt = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastAt < kElevMs) return;
+    lastAt = now;
+    if (!g_log) return;
+    auto read = [](void* d, uintptr_t s, size_t n) { return ReadMem(d, s, n); };
+    // wide: a look-at on a raised floor is sheared away from the grid by L.y * k on each axis (41 units at L.y = 33.7)
+    float px = 0, pz = 0, best = 200.0f * 200.0f;
+    bool found = false;
+    unitscan::EachUnit(read, table, unitscan::kPlayer, [&](uintptr_t, const unitscan::Unit& u) {
+        float x, z;
+        if (!unitscan::Place(read, u, &x, &z)) return true;
+        const float d2 = (x - hx) * (x - hx) + (z - hz) * (z - hz);
+        if (d2 < best) {
+            best = d2;
+            px = x;
+            pz = z;
+            found = true;
+        }
+        return true;
+    });
+    char b[320];
+    if (found) {
+        const float rx = hx - px, rz = hz - pz, s = hy * kShear;
+        const char* verdict = fabsf(hy) < 0.5f ? "floor ~0 here, cannot tell"
+                              : (fabsf(rx) < 0.75f && fabsf(rz) < 0.75f) ? "look-at is on the GRID (unsheared)"
+                              : (fabsf(rx - s) < 0.75f && fabsf(rz - s) < 0.75f) ? "look-at is the RENDER point (sheared by its height)"
+                                                                                : "neither - see the numbers";
+        snprintf(b, sizeof b, "flat elev: look-at (%.2f, %.2f, %.2f), hero path (%.2f, %.2f), r = (%+.2f, %+.2f), L.y*k = %+.2f: %s", hx, hy, hz,
+                 px, pz, rx, rz, s, verdict);
+    } else {
+        snprintf(b, sizeof b, "flat elev: look-at (%.2f, %.2f, %.2f), no player unit within 200 of it on the grid", hx, hy, hz);
+    }
+    g_log(b);
+    char c[320];
+    int n = snprintf(c, sizeof c, "flat elev: rays asked in %llu s:", kElevMs / 1000);
+    bool any = false;
+    for (int i = 0; i < kCallerSlots && n > 0 && n < (int)sizeof c; ++i) {
+        const uintptr_t rva = g_callerRva[i].load(std::memory_order_relaxed);
+        const uint32_t cnt = g_callerN[i].exchange(0, std::memory_order_relaxed), mid = g_callerCentre[i].exchange(0, std::memory_order_relaxed);
+        if (!rva || !cnt) continue;
+        any = true;
+        n += snprintf(c + n, sizeof c - n, " 0x%llX x%u (%u at the middle)", (unsigned long long)rva, cnt, mid);
+    }
+    if (!any && n > 0 && n < (int)sizeof c) snprintf(c + n, sizeof c - n, " none");
+    g_log(c);
+    snprintf(b, sizeof b, "flat elev: adjust - aimed at feet %u, isometric to a body %u, isometric to the floor %u, crosshair missed the floor %u (flat_iso_ray %d)",
+             g_nFeet.exchange(0), g_nIsoBody.exchange(0), g_nIsoGround.exchange(0), g_nGroundMiss.exchange(0), g_iso.load() ? 1 : 0);
+    g_log(b);
+    TargetsLog(snap, hx, hy, hz);
+}
+
 }  // namespace
 
 void SetLog(void (*fn)(const char*)) { g_log = fn; }
+
+void SetModes(bool isoRay, bool elevLog) {
+    if (g_log && g_iso.exchange(isoRay) != isoRay)
+        g_log(isoRay ? "flat pick: isometric ray on ([input] flat_iso_ray=1)" : "flat pick: isometric ray off ([input] flat_iso_ray=0)");
+    g_iso.store(isoRay);
+    g_elev.store(elevLog);
+}
 
 void Refresh(bool active, float heroX, float heroY, float heroZ) {
     const int cur = g_published.load(std::memory_order_relaxed);
     Snap& dst = g_snap[1 - cur];
     dst.nBody = 0;
     dst.nObj = 0;
+    dst.hero = false;
     if (!active || !std::isfinite(heroX + heroY + heroZ)) {
         g_published.store(1 - cur, std::memory_order_release);
         g_toldOn = false;
@@ -238,6 +410,11 @@ void Refresh(bool active, float heroX, float heroY, float heroZ) {
         g_published.store(1 - cur, std::memory_order_release);
         return;
     }
+    dst.hero = true;
+    dst.heroY = heroY;
+    // The look-at is the RENDER point of the hero (measured 2026-10-24, [debug] flat_elev: L - path place = L.y * k on both axes), the
+    // units' places are on the GRID: the reach and the nearest-first order are the hero's grid place's.
+    const float gridX = heroX - heroY * kShear, gridZ = heroZ - heroY * kShear;
     auto read = [](void* d, uintptr_t s, size_t n) { return ReadMem(d, s, n); };
     if (active && !d2rsig::Check(kMonStats, kSigMonStats, sizeof kSigMonStats)) {
         if (!g_toldMiss && g_log) {
@@ -250,10 +427,10 @@ void Refresh(bool active, float heroX, float heroY, float heroZ) {
             if (mode == 0 || mode == 12) return true;
             float x, z;
             if (!unitscan::Place(read, u, &x, &z)) return true;
-            const float dx = x - heroX, dz = z - heroZ;
+            const float dx = x - gridX, dz = z - gridZ;
             const float d2 = dx * dx + dz * dz;
             if (d2 > kReach * kReach) return true;
-            const int slot = KeepSlot(dst, 0, dst.nBody, kBodyCap, d2, heroX, heroZ);
+            const int slot = KeepSlot(dst, 0, dst.nBody, kBodyCap, d2, gridX, gridZ);
             if (slot < 0) return true;
             if (slot == dst.nBody) ++dst.nBody;
             uint8_t fa = 0, fb = 0, h = 0;
@@ -276,10 +453,10 @@ void Refresh(bool active, float heroX, float heroY, float heroZ) {
         if (ObjClosedOnly(kind) && mode > 1) return true;
         float x, z;
         if (!ObjectPlace(u, &x, &z)) return true;
-        const float dx = x - heroX, dz = z - heroZ;
+        const float dx = x - gridX, dz = z - gridZ;
         const float d2 = dx * dx + dz * dz;
         if (d2 > kReach * kReach) return true;
-        const int slot = KeepSlot(dst, kBodyCap, dst.nObj, kObjCap, d2, heroX, heroZ);
+        const int slot = KeepSlot(dst, kBodyCap, dst.nObj, kObjCap, d2, gridX, gridZ);
         if (slot < 0) return true;
         if (slot == kBodyCap + dst.nObj) ++dst.nObj;
         Cap& c = dst.c[slot];
@@ -297,11 +474,15 @@ void Refresh(bool active, float heroX, float heroY, float heroZ) {
         snprintf(b, sizeof b, "flat pick: body aim on, %d bodies, %d objects in reach", dst.nBody, dst.nObj);
         g_log(b);
     }
+    if (g_elev.load(std::memory_order_relaxed)) ElevLog(dst, heroX, heroY, heroZ, table);
 }
 
-void Adjust(float origin[3], float dir[3]) {
+void Adjust(float origin[3], float dir[3], const float px[2], float vpW, float vpH, uintptr_t callerRva) {
     const Snap& snap = g_snap[g_published.load(std::memory_order_acquire)];
-    if (snap.nBody <= 0 && snap.nObj <= 0) return;
+    const bool centre = AtCentre(px, vpW, vpH);
+    if (g_elev.load(std::memory_order_relaxed)) CountCaller(callerRva, centre);
+    const bool iso = g_iso.load(std::memory_order_relaxed) && snap.hero;
+    if (snap.nBody <= 0 && snap.nObj <= 0 && !iso) return;
     float len = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
     if (!(len > 0.5f)) return;
     dir[0] /= len;
@@ -311,14 +492,42 @@ void Adjust(float origin[3], float dir[3]) {
     float bestT = 1.0e30f;
     auto consider = [&](int i) {
         float t = 0;
-        if (RayCapsule(origin, dir, snap.c[i], &t) && t < bestT) {
+        // the capsule stands where the picture draws the unit: its grid place sheared up by the floor's height
+        Cap rc = snap.c[i];
+        rc.x += rc.y * kShear;
+        rc.z += rc.y * kShear;
+        if (RayCapsule(origin, dir, rc, &t) && t < bestT) {
             bestT = t;
             best = i;
         }
     };
     for (int i = 0; i < snap.nBody; ++i) consider(i);
     for (int i = 0; i < snap.nObj; ++i) consider(kBodyCap + i);
-    if (best >= 0) AimFeet(origin, dir, snap.c[best]);
+    if (best >= 0) {
+        const Cap& c = snap.c[best];
+        if (!iso) {
+            AimFeet(origin, dir, c);
+            g_nFeet.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // The feet as the renderer would draw them on the hero's floor: their grid place is the unit's path place.
+        const float feet[3] = {c.x + c.y * kShear, c.y, c.z + c.y * kShear};
+        IsoRay(origin, dir, feet);
+        g_nIsoBody.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // No body: only the crosshair's own ray (the game's mouse code asks for the middle in the flat mouse look). Where it
+    // meets the hero's floor in the picture, and the isometric ray through that point, so the game walks or casts there.
+    if (!iso || !centre) return;
+    const float t = dir[1] < -1.0e-4f ? (snap.heroY - origin[1]) / dir[1] : -1.0f;
+    const float hit[3] = {origin[0] + t * dir[0], snap.heroY, origin[2] + t * dir[2]};
+    const float along = t * sqrtf(dir[0] * dir[0] + dir[2] * dir[2]);
+    if (!(t > 0.0f) || !(along <= kGroundReach) || !std::isfinite(hit[0] + hit[2])) {
+        g_nGroundMiss.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    IsoRay(origin, dir, hit);
+    g_nIsoGround.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool MonsterPose(uintptr_t unit, float floorY, float* x, float* y, float* z, float* height) {
@@ -342,8 +551,9 @@ bool MonsterPose(uintptr_t unit, float floorY, float* x, float* y, float* z, flo
 }
 
 uintptr_t NearestMonster(float hx, float hy, float hz, float reach) {
-    (void)hy;   // look-at Y unused: Place and LookAt share one frame (not F4 sheared pose)
-    if (!std::isfinite(hx + hz + reach) || reach < 0.0f) return 0;
+    if (!std::isfinite(hx + hy + hz + reach) || reach < 0.0f) return 0;
+    hx -= hy * kShear;   // the look-at is the render point; the units' places are on the grid
+    hz -= hy * kShear;
     const uintptr_t table = d2rsig::Addr(kUnits);
     if (!table) return 0;
     auto read = [](void* d, uintptr_t s, size_t n) { return ReadMem(d, s, n); };

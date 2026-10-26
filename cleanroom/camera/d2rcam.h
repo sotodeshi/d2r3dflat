@@ -69,8 +69,10 @@ void SetRayOverride(RayFn ray);
 
 // After the camera ray is built (not when RayFn replaced it, not for shadows):
 // may rewrite origin/dir. Used so a flat first-person cursor on a body picks
-// that unit's feet, which is where the game's ground test looks.
-using RayAdjustFn = void (*)(float origin[3], float dir[3]);
+// that unit's feet, which is where the game's ground test looks. px: the pixel
+// the game asked for, vpW/vpH: the viewport it is in, callerRva: the return
+// address of the game's call, as an RVA (which of the game's codes asked).
+using RayAdjustFn = void (*)(float origin[3], float dir[3], const float px[2], float vpW, float vpH, uintptr_t callerRva);
 void SetRayAdjust(RayAdjustFn fn);
 
 // The point the game camera aims at (the hero), read from the camera now.
@@ -83,6 +85,13 @@ bool InWorld();
 // Screen point in the game's viewport pixels -> world ray through the matrices
 // in use this frame (ours when enabled). dir is normalized. False when not in world.
 bool PickRay(float sx, float sy, float origin[3], float dir[3]);
+
+// The game's viewport in pixels this frame. False when not in world.
+bool ViewportNow(float* w, float* h);
+
+// A world point -> the game's viewport pixel through the matrices in use this frame (the inverse of PickRay).
+// False when not in world or the point is behind the camera.
+bool WorldToScreen(const float p[3], float* sx, float* sy);
 
 // Render distance in rooms around the hero (rings of D2 rooms). 1 is the game's
 // own behaviour. 2 draws every room the game already keeps loaded, in every

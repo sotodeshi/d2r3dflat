@@ -2032,6 +2032,9 @@ void LoadSettings() {
     g_set.flatBodyPickThird.store(IniB(L"input", L"flat_body_pick_third", true));
     g_set.portalFace.store(std::clamp((int)IniF(L"input", L"portal_face", 1.0f), 0, 2));
     g_set.npcLookHorizon.store(IniB(L"input", L"npc_look_horizon", true));
+    // [input] flat_iso_ray: the game's ground test gets the old isometric camera's ray through the point meant (vr/flat_pick.h);
+    // [debug] flat_elev: the look-at's frame (grid or render) and the rays' callers in the log. Both need flat_body_pick(_third) on.
+    flatpick::SetModes(IniB(L"input", L"flat_iso_ray", true), IniB(L"debug", L"flat_elev", false));
     {
         const bool axis = g_set.platform.load() == 0 && IniB(L"input", L"portal_axis", false);
         if (axis != g_set.portalAxis.exchange(axis))
@@ -3329,7 +3332,8 @@ void VrFrame() {
                 // Upper chest / neck: aiming here with a small upward clear leaves the head
                 // below screen centre so the dialogue sits in the sky for short and tall NPCs.
                 const float aimY = ny + nh * 0.70f;
-                const float dx = nx - look[0], dz = nz - look[2];
+                constexpr float kShear = 1.22474487139f;   // the look-at is the render point of the hero, the NPC's place the grid's (flat_elev, 2026-10-24)
+                const float dx = nx - (look[0] - look[1] * kShear), dz = nz - (look[2] - look[1] * kShear);
                 float horiz = sqrtf(dx * dx + dz * dz);
                 if (horiz < 0.75f) horiz = 0.75f;
                 const float downDeg = atan2f(eyeY - aimY, horiz) * (180.0f / 3.14159265f);

@@ -30,10 +30,10 @@ camera, and a hit still aims it at the unit's feet.
 Bodies are unit type 1 (NPCs and monsters share that hash). Dead modes 0 and 12 are
 skipped. Height comes from the MonStats row (`pixHeight * 0.10` when that byte is in
 20..200, otherwise 7). Radius comes from the footprint bytes, clamped to 1.5..3.5.
-Feet Y is the hero's ground (the path has no elevation). Capsules sit at path XZ + that Y
-(MonStats / object height). LookAt and Place share one frame — F4's absolute ground shear
-must not be applied here (v15 tried; hover and name labels vanished). No extra vertical
-slack for raised pads. Relative shear for elevated pads is still open.
+Feet Y is the hero's ground (the path has no elevation). Capsules sit at the unit's grid
+place sheared up by that floor's height, where the picture draws it; see section 8 (the camera's
+look-at is NOT on the grid on raised ground, and the ray is handed to the game along the old
+isometric line).
 
 Objects are unit type 2. The place is the static path at `+0x10` / `+0x14`, converted the
 same way as the torch lights (`2 * tile + 1`). Which ids count is a table generated from
@@ -275,3 +275,50 @@ Auto use on walk-in (`[input] portal_walk_in`, map-click / walk-to-unit) was tri
 worked for the teleport, but left edge cases around the client's left-button latch after
 area changes. Removed: portals are used by a click again. The oval collapse (§6) stays,
 now gated to flat F2/F3 only (`g_enabled`), so isometric F1 keeps the game's black centre.
+
+## 8. Picking, casting and aiming on raised ground (stairs, platforms, caves)
+
+On ground above height 0 (stairs, a platform, a cave floor: the hero's floor was 33.7 world
+units in the Act 2 palace and the Act 4 fortress where this was measured) flat first and third
+person could not select a chest, a door or a monster, and a directional or area spell did not
+land under the crosshair. Two causes, both measured with `[debug] flat_elev=1`:
+
+1. **The camera's look-at is the hero's RENDER point, not his grid place.** The renderer shears
+   raised ground along both horizontal axes: `render = grid + height * k, k = sqrt(3/2) = 1.2247`.
+   The log line `look-at (10091.60, 33.73, 10131.44), hero path (10050.26, 10090.10), r = (+41.33,
+   +41.33), L.y*k = +41.31` shows `look-at - path place = L.y * k` on both axes, to 0.02. The
+   body-pick code treated the two as one frame (v15's reasoning, "LookAt and Place share one frame",
+   was only ever tested on flat ground, where the shear is 0). Its capsules therefore stood about
+   `L.y * k` (41 units here) beside the units in the picture, the 55-unit reach and the
+   nearest-first order were measured from the wrong point, and the NPC dialogue's look-down angle
+   (`npc_look_horizon`) used the same mix. Now the hero's grid place is `look-at - L.y * k`, and a
+   capsule is tested at `grid + y * k`. In the log the stash's base then projects 32 px from the
+   crosshair when the crosshair is on it, and `crosshair-axis floor h` is within 0.4 of the hero's
+   floor.
+2. **The ray handed to the game.** The game's mouse code (one caller, RVA `0x7E7F60`, always at
+   the middle of the screen in the mouse look) meets the ray with its ground and reads a grid
+   place. It was built for the old isometric camera, whose every ray runs along `-(k, 1, k)`; a
+   perspective ray from the eye aimed at a grid point on the hero's floor lands beside it by
+   `height * k`. `[input] flat_iso_ray=1` (default on) hands it the isometric ray instead: through
+   the picked body's or object's feet as drawn, and, with nothing picked, through the point where
+   the crosshair's ray meets the hero's floor. Every point of that line has the same grid place,
+   so the game's ground test lands where the picture is. Confirmed in play: objects are selected
+   at any height, directional spells go where the crosshair looks, and area spells are placed
+   under it.
+
+`[debug] flat_elev=1` (off by default, live, read only) writes three lines every 2 s: the look-at
+against the hero's path place with a verdict (grid or render), which of the game's codes asked
+for rays and how many at the middle, and what the aim did; then, for the two nearest bodies and
+objects, the pixel of their feet in both frames, their top, and the floor height the
+crosshair's ray implies. That last number is meaningless when the camera looks along the
+isometric diagonal (about 30 degrees down at 45 degrees of heading): the ray is then nearly
+parallel to the axis it is measured against.
+
+`d2rcam::RayAdjustFn` now also receives the pixel, the viewport and the caller's RVA, and
+`d2rcam::WorldToScreen` / `ViewportNow` exist for the log.
+
+Open: a unit whose body is taller or standing off its path place (Tyrael in the Act 4 Pandemonium
+Fortress) needs the crosshair a little to the right of him and at his feet. See `PRZEKAZANIE.md`.
+
+Files: `vr/flat_pick.h`, `vr/flat_pick.cpp`, `cleanroom/camera/d2rcam.h`,
+`cleanroom/camera/d2rcam.cpp`, `vr/vrcam.cpp` (ini keys, NPC dialogue angle), `d2r_vr.ini`.
