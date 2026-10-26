@@ -28,6 +28,13 @@ void Refresh(bool active, float heroX, float heroY, float heroZ);
 // isometric ray through where it meets the hero's floor.
 void Adjust(float origin[3], float dir[3], const float px[2], float vpW, float vpH, uintptr_t callerRva);
 
+// [debug] flat_elev: on; and, at a click of the game's mouse code, the game's hover result against the last ray handed to it (type: the click's
+// type, hovered: the game found a unit under the pointer).
+bool ElevOn();
+void LogClick(int type, bool hovered);
+// The probe reads the game's own hover (vrcam: HoverUnit of the local player): false when it cannot, else hovered and the unit's type and class.
+void SetHoverProbe(bool (*fn)(bool* hovered, uint32_t* type, uint32_t* cls));
+
 // Live monster/NPC: ground place and MonStats body height (world units).
 // floorY is the feet height (hero ground). false if not a monster or unread.
 bool MonsterPose(uintptr_t unit, float floorY, float* x, float* y, float* z, float* height);

@@ -6357,6 +6357,27 @@ MapClickFn OrigMapClick;
 std::atomic<int> g_mapClick{0};   // 0 not in yet, 1 in, 2 not possible
 std::atomic<bool> g_hoverHooked{false};   // spell_aim's hook is on HoverUnit (its bytes checked then): no longer as they were
 
+// [debug] flat_elev: the game's own hover without a click (vr/flat_pick.h HoverWatch). Called from the mouse code's ray hook, so on the thread
+// that runs the game's mouse code - the one HookMapClick asks HoverUnit on. Guarded: a stale answer must not take the game down.
+bool FlatHoverProbe(bool* hovered, uint32_t* type, uint32_t* cls) noexcept {
+    constexpr uint64_t RVA_LOCAL_INDEX = 0x8B2D0;
+    const uintptr_t indexFn = d2rsig::Addr(RVA_LOCAL_INDEX), hoverFn = d2rsig::Addr(RVA_HOVER_UNIT);
+    if (!indexFn || !hoverFn || !g_inWorld.load()) return false;
+    __try {
+        const int index = reinterpret_cast<int (*)()>(indexFn)();
+        if (index < 0 || index >= 8) return false;
+        const uint8_t* u = static_cast<const uint8_t*>(reinterpret_cast<HoverUnitFn>(hoverFn)(index));
+        *hovered = u != nullptr;
+        if (u) {
+            *type = *reinterpret_cast<const uint32_t*>(u);
+            *cls = *reinterpret_cast<const uint32_t*>(u + 4);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 uint64_t HookMapClick(void* unit, int type, int x, int y, uint64_t flags) {
     const bool mouseType = type == 0 || type == 1 || type == 3 || type == 4;
     // nothing under the pointer? the game's own lookup (HoverUnit), asked once for whoever needs it
@@ -6385,6 +6406,8 @@ uint64_t HookMapClick(void* unit, int type, int x, int y, uint64_t flags) {
             }
         }
     }
+    // [debug] flat_elev: what the game's own hover found at this click (flat with the mouse look), against the ray it was handed (vr/flat_pick.h)
+    if (unit && (type == 0 || type == 3) && flatpick::ElevOn() && KeyMoveMode() && ShooterActive()) flatpick::LogClick(type, !bare());
     shottrace::ClickTrace shotTrace(unit, type, x, y, flags);   // [debug] shot_trace: the click, and when it returns (nothing when no shot is watched)
     // [gameplay] block_stray_walk (F4): a walk or run to a point that comes out of this click is told by the click's type and by
     // whether anything is under the pointer (vr/stray_walk.h); the guard itself sits on the game's command funnel
@@ -17547,6 +17570,7 @@ D2RL_PLUGIN_EXPORT bool D2RLoaderLoadPlugin(const PluginContext* ctx) noexcept {
     d2rcam::SetFrameCallback(&VrFrame);
     d2rcam::SetRayOverride(&VrRay);
     flatpick::SetLog(&Log);
+    flatpick::SetHoverProbe(&FlatHoverProbe);
     d2rcam::SetRayAdjust(&flatpick::Adjust);
     MH_Initialize();   // XInput only; game code is hooked through the loader
     skel::SetGameBase(g_base);

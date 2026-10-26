@@ -36,6 +36,7 @@ void (*g_log)(const char*) = nullptr;
 
 struct Cap {
     float x = 0, y = 0, z = 0, height = 0, radius = 0;
+    uint32_t cls = 0;              // the unit's class (MonStats / Objects row), for the log
 };
 struct Snap {
     Cap c[kCap]{};
@@ -63,6 +64,23 @@ constexpr int kCallerSlots = 8;
 std::atomic<uintptr_t> g_callerRva[kCallerSlots]{};
 std::atomic<uint32_t> g_callerN[kCallerSlots]{}, g_callerCentre[kCallerSlots]{};
 std::atomic<uint32_t> g_nFeet{0}, g_nIsoBody{0}, g_nIsoGround{0}, g_nGroundMiss{0};
+
+// The last ray the mouse code was handed (for the click log): 1 isometric through a body, 2 isometric through the floor under the crosshair,
+// 3 aimed at feet from the eye, 0 left as it was. gx, gz: the grid place that ray stands for; cls, ux, uz: the unit it was aimed at.
+std::atomic<int> g_lastMode{0};
+std::atomic<float> g_lastGx{0}, g_lastGz{0}, g_lastUx{0}, g_lastUz{0};
+std::atomic<uint32_t> g_lastCls{0};
+std::atomic<ULONGLONG> g_lastAt{0};
+bool (*g_probe)(bool* hovered, uint32_t* type, uint32_t* cls) = nullptr;   // [debug] flat_elev: the game's own hover, read by vrcam
+void NoteRay(int mode, float gx, float gz, const Cap* unit) {
+    g_lastMode.store(mode, std::memory_order_relaxed);
+    g_lastGx.store(gx, std::memory_order_relaxed);
+    g_lastGz.store(gz, std::memory_order_relaxed);
+    g_lastUx.store(unit ? unit->x : 0.0f, std::memory_order_relaxed);
+    g_lastUz.store(unit ? unit->z : 0.0f, std::memory_order_relaxed);
+    g_lastCls.store(unit ? unit->cls : 0xFFFFFFFFu, std::memory_order_relaxed);
+    g_lastAt.store(GetTickCount64(), std::memory_order_relaxed);
+}
 
 void CountCaller(uintptr_t rva, bool centre) {
     for (int i = 0; i < kCallerSlots; ++i) {
@@ -440,6 +458,7 @@ void Refresh(bool active, float heroX, float heroY, float heroZ) {
             c.y = heroY;
             c.z = z;
             SizeOf(fa, fb, h, known, &c.height, &c.radius);
+            c.cls = unitscan::Field32(u, unitscan::kOffClass);
             return true;
         });
     }
@@ -465,6 +484,7 @@ void Refresh(bool active, float heroX, float heroY, float heroZ) {
         c.z = z;
         c.height = ObjHeight(kind);
         c.radius = ObjRadius(packed);
+        c.cls = cls;
         return true;
     });
     g_published.store(1 - cur, std::memory_order_release);
@@ -477,7 +497,10 @@ void Refresh(bool active, float heroX, float heroY, float heroZ) {
     if (g_elev.load(std::memory_order_relaxed)) ElevLog(dst, heroX, heroY, heroZ, table);
 }
 
+void HoverWatch();
+
 void Adjust(float origin[3], float dir[3], const float px[2], float vpW, float vpH, uintptr_t callerRva) {
+    if (g_elev.load(std::memory_order_relaxed)) HoverWatch();   // what the ray before this one found
     const Snap& snap = g_snap[g_published.load(std::memory_order_acquire)];
     const bool centre = AtCentre(px, vpW, vpH);
     if (g_elev.load(std::memory_order_relaxed)) CountCaller(callerRva, centre);
@@ -508,12 +531,24 @@ void Adjust(float origin[3], float dir[3], const float px[2], float vpW, float v
         if (!iso) {
             AimFeet(origin, dir, c);
             g_nFeet.fetch_add(1, std::memory_order_relaxed);
+            NoteRay(3, c.x, c.z, &c);
             return;
         }
         // The feet as the renderer would draw them on the hero's floor: their grid place is the unit's path place.
-        const float feet[3] = {c.x + c.y * kShear, c.y, c.z + c.y * kShear};
+        // A body is aimed at the height of the body, not at its feet: the game's hover is built for the isometric picture, where a pixel of
+        // a unit's body stands for the ground point `grid - height * k` (both axes), and a unit that floats (Tyrael) has no hover at its
+        // feet at all (measured 2026-10-26 with [debug] flat_elev: his hover starts about 2 units behind the path place, along that
+        // diagonal, and runs on to 10 and more; other NPCs and monsters have it at the feet too). So the isometric ray goes through the
+        // point of the body's axis at the height the crosshair meets it, kept in 25 .. 60 % of the body's height. Objects stay on the feet.
+        float up = 0.0f;
+        if (best < kBodyCap) {
+            const float hitY = origin[1] + bestT * dir[1] - c.y;
+            up = std::clamp(hitY, 0.25f * c.height, 0.6f * c.height);
+        }
+        const float feet[3] = {c.x + c.y * kShear, c.y + up, c.z + c.y * kShear};
         IsoRay(origin, dir, feet);
         g_nIsoBody.fetch_add(1, std::memory_order_relaxed);
+        NoteRay(1, c.x - up * kShear, c.z - up * kShear, &c);
         return;
     }
     // No body: only the crosshair's own ray (the game's mouse code asks for the middle in the flat mouse look). Where it
@@ -528,7 +563,86 @@ void Adjust(float origin[3], float dir[3], const float px[2], float vpW, float v
     }
     IsoRay(origin, dir, hit);
     g_nIsoGround.fetch_add(1, std::memory_order_relaxed);
+    NoteRay(2, hit[0] - snap.heroY * kShear, hit[2] - snap.heroY * kShear, nullptr);   // the grid place of the floor point
 }
+
+// The last ray's grid point against the nearest body, one line. tag: what asked ("click type 0", "hover"), hovered/htype/hcls: the game's own hover.
+void LogLast(const char* tag, bool hovered, uint32_t htype, uint32_t hcls) {
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG age = now - g_lastAt.load(std::memory_order_relaxed);
+    const int mode = g_lastMode.load(std::memory_order_relaxed);
+    char hv[48] = "none";
+    if (hovered) snprintf(hv, sizeof hv, "unit type %u class %u", htype, hcls);
+    char b[460];
+    if (mode == 0 || age > 1000) {
+        snprintf(b, sizeof b, "flat elev: %s, game's hover: %s, no ray of ours in the last second (mode %d, %llu ms)", tag, hv, mode, (unsigned long long)age);
+        g_log(b);
+        return;
+    }
+    const float gx = g_lastGx.load(std::memory_order_relaxed), gz = g_lastGz.load(std::memory_order_relaxed);
+    const Snap& snap = g_snap[g_published.load(std::memory_order_acquire)];
+    int nearest = -1;
+    float nd = 1.0e30f;
+    for (int i = 0; i < snap.nBody; ++i) {
+        const float ex = snap.c[i].x - gx, ez = snap.c[i].z - gz, e = ex * ex + ez * ez;
+        if (e < nd) {
+            nd = e;
+            nearest = i;
+        }
+    }
+    const char* what = mode == 1 ? "isometric ray through a body's feet" : mode == 2 ? "isometric ray through the floor under the crosshair" : "ray aimed at feet from the eye";
+    if (nearest >= 0) {
+        const Cap& c = snap.c[nearest];
+        snprintf(b, sizeof b, "flat elev: %s, game's hover: %s; the ray before it: %s, grid point (%.1f, %.1f); nearest body class %u at (%.1f, %.1f) height %.1f, offset (%+.1f, %+.1f) = %.1f; aimed at class %d",
+                 tag, hv, what, gx, gz, c.cls, c.x, c.z, c.height, gx - c.x, gz - c.z, sqrtf(nd), g_lastCls.load(std::memory_order_relaxed) == 0xFFFFFFFFu ? -1 : (int)g_lastCls.load(std::memory_order_relaxed));
+    } else {
+        snprintf(b, sizeof b, "flat elev: %s, game's hover: %s; the ray before it: %s, grid point (%.1f, %.1f); no body in reach", tag, hv, what, gx, gz);
+    }
+    g_log(b);
+}
+
+// [debug] flat_elev: at a click of the game's mouse code, what its own hover found against the ray it was handed. The measure of the
+// game's selection region of a unit: mode 2 (floor) with a hover puts a grid point inside it, none outside; offset = that point
+// minus the nearest body's path place (grid units). Mode 1 / 3 aimed at a body's feet.
+void LogClick(int type, bool hovered) {
+    if (!g_elev.load(std::memory_order_relaxed) || !g_log) return;
+    static ULONGLONG lastAt = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastAt < 250) return;
+    lastAt = now;
+    char tag[32];
+    snprintf(tag, sizeof tag, "click type %d", type);
+    LogLast(tag, hovered, 0, 0);
+}
+
+// Without a click: every ray of the mouse code the game's hover is asked (the probe: HoverUnit of the local player, on the mouse code's own
+// thread) - it still holds what the ray before this one found. A change of what is under the pointer is told at once, and 4 a second at most.
+void SetHoverProbe(bool (*fn)(bool* hovered, uint32_t* type, uint32_t* cls)) { g_probe = fn; }
+void HoverWatch() {
+    static bool lastHover = false, told = false;
+    static uint32_t lastType = 0, lastCls = 0;
+    static ULONGLONG lastAt = 0;
+    bool hovered = false;
+    uint32_t type = 0, cls = 0;
+    if (!g_probe || !g_probe(&hovered, &type, &cls)) {
+        if (!told && g_log) {
+            told = true;
+            g_log("flat elev: hover probe - the game's hover cannot be read yet");
+        }
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    const bool changed = hovered != lastHover || (hovered && (type != lastType || cls != lastCls));
+    if (!changed && !(hovered && now - lastAt >= 1000)) return;
+    if (now - lastAt < 250) return;
+    lastAt = now;
+    lastHover = hovered;
+    lastType = type;
+    lastCls = cls;
+    LogLast("hover", hovered, type, cls);
+}
+
+bool ElevOn() { return g_elev.load(std::memory_order_relaxed); }
 
 bool MonsterPose(uintptr_t unit, float floorY, float* x, float* y, float* z, float* height) {
     if (!unit || !x || !y || !z || !height || !std::isfinite(floorY)) return false;

@@ -118,8 +118,9 @@ Szczegóły i powód są w `CHANGES.md`. Krótko:
     2026-10-26 przez `[debug] flat_elev`). Naprawione w v17: kapsuły w `grid + y·k`, zasięg od siatki bohatera,
     promień izometryczny `[input] flat_iso_ray=1` (domyślnie 1). Potwierdzone w grze: obiekty zaznaczają się
     na każdej wysokości, czary kierunkowe i obszarowe idą pod celownik (CHANGES.md pkt 8).
-14. Otwarte: kapsuła Tyraela w Fortecy Pandemonium (akt 4) jest przesunięta — trzeba celować nieco na prawo od
-    niego i w stopy.
+14. Tyrael (akt 4, Forteca Pandemonium) lewituje: jego hover w grze nie obejmuje stóp, tylko punkty o 2–12 jednostek
+    wstecz po przekątnej `(−1,−1)`. Naprawione: promień izometryczny dla ciał idzie przez oś ciała na 25–60% jego
+    wysokości, nie przez stopy (CHANGES.md, „Floating units”). `[debug] flat_elev` czyta teraz hover gry bez klikania.
 
 ## Próby, które nie weszły
 

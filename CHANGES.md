@@ -317,8 +317,27 @@ parallel to the axis it is measured against.
 `d2rcam::RayAdjustFn` now also receives the pixel, the viewport and the caller's RVA, and
 `d2rcam::WorldToScreen` / `ViewportNow` exist for the log.
 
-Open: a unit whose body is taller or standing off its path place (Tyrael in the Act 4 Pandemonium
-Fortress) needs the crosshair a little to the right of him and at his feet. See `PRZEKAZANIE.md`.
-
 Files: `vr/flat_pick.h`, `vr/flat_pick.cpp`, `cleanroom/camera/d2rcam.h`,
 `cleanroom/camera/d2rcam.cpp`, `vr/vrcam.cpp` (ini keys, NPC dialogue angle), `d2r_vr.ini`.
+
+### Floating units (Tyrael, Act 4 Pandemonium Fortress)
+
+Aiming the isometric ray at a body's feet selected every NPC and monster except Tyrael, who is only
+highlighted with the crosshair a little to one side of him and at his feet. The game's hover was read
+without clicking (a click on an NPC walks the hero up to him): `[debug] flat_elev` now asks the game's own
+`HoverUnit` for the local player at every ray the mouse code asks for, and logs what it found next to the
+grid point the previous ray stood for. For Tyrael (class 367, path place `(10041.0, 10041.0)`):
+
+- the ray through his path place: no hover (4 of 4);
+- hover for grid points from `(-0.3, -2.3)` to about `(-7.6, -11.5)` away from his path place, along the
+  `(-1, -1)` diagonal; none at `(+6.9, -3.2)` or `(-11.6, -17.3)`.
+
+Other NPCs (classes 405 and 246) have the hover exactly at their path place. The game's hover is built for
+the isometric picture, where a pixel of a unit's body stands for the ground point `grid - height * k` on both
+axes, so a model that floats above the ground has its hover region moved back along that diagonal and the
+feet are outside it. Fix: for a body (not an object) the isometric ray goes through the point of its axis at
+the height the crosshair meets it, kept between 25 and 60 % of its height, instead of through its feet. Objects
+stay on the feet (chests, doors and the stash were confirmed there). Confirmed in play: Tyrael is highlighted
+with the crosshair on his body, and other NPCs and monsters are still selected.
+
+Files: `vr/flat_pick.cpp` (`Adjust`), `vr/vrcam.cpp` (`FlatHoverProbe`), `vr/flat_pick.h`.
