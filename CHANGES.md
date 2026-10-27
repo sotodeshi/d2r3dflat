@@ -114,25 +114,33 @@ fog, so the mix becomes pure fog colour and the effect is erased. The further th
 background is, the more of the effect goes. High in the sky there is no depth, and the
 effect stays.
 
-The mix that does run there now puts the light back on top of the fog, and only when the
-pixel is bright. The same band as over the void, a peak channel from 0.45 to 0.85.
-At the end of the ordinary fog mix (about line 1614, after the cave-halo return):
+Two small blocks in `D2R_DepthFog.fx` put the light back, both keyed to how bright the pixel is
+(a peak channel from 0.45 to 0.85, so dim ground, leaves and grass still take the fog):
+
+- At the end of the ordinary fog mix (`DepthFogWorld`, after the cave-halo return):
 
 ```
 const float light = smoothstep(0.45, 0.85, max(colour.r, max(colour.g, colour.b)));
 return lerp(colour, fogColour, t) + colour * (t * light);
 ```
 
-At full fog the ground stays fog colour and a bright mark, spell or hand is added back
-whole. Near the player `t` is about 0, so the picture is unchanged. Dim ground, leaves and
-grass still take the fog. Very bright foam on far water can come back on that strip.
-Confirmed in play: the effects are much easier to see, spells in particular. No DLL change.
-ReShade reads the effect at game start.
+- In the branch for pixels over the empty depth buffer (the void), the fog amount `tf` taken from
+  the ground a few pixels below is lowered for bright pixels, before the colour is added:
 
-Shader files, the same change in both:
+```
+tf = lerp(tf, 0.0, smoothstep(0.45, 0.85, max(colour.r, max(colour.g, colour.b))));
+```
 
-- the one the game runs: `reshade-shaders\Shaders\D2R_DepthFog.fx` beside `D2R.exe`
-- the copy in this tree: `reshade/D2R_DepthFog.fx`
+Confirmed in play on 0.185 (2026-10-27): spells at the horizon keep their light; with only the first
+block part of them was still cut. Very bright foam on far water can come back on that strip.
+
+`[fog] spare_effects=1` is not needed for this and costs a lot in flat mode: in the Act 2 lowered
+level (where the ground patches of section 10 are) it made the game lag badly every time it was
+on, and the lag was gone with it off (on, off and on again in the same place). Turning it on needs a
+game restart; turning it off works live. Tested with the 0.171-based plugin on the 0.185 effect.
+
+Shader only, no DLL change. ReShade reads the effect at game start. The exact edits against the 0.185
+effect, with before and after, are in `SHADER_CHANGES.md`.
 
 ## 6. A portal's black centre
 

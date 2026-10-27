@@ -34,3 +34,6 @@ __pycache__/
 /build_public/
 promo/
 /installer/launcher/cache/
+
+# the authors' released files per version (their binaries, not ours; for comparison only)
+/originals/
