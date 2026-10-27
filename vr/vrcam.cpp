@@ -11330,7 +11330,9 @@ bool ItemLabelOnScreen(void* unit) {
     memcpy(m, g_labelView, sizeof m);
     ReleaseSRWLockShared(&g_labelViewLock);
     if (!(std::isfinite(m[15]) && std::fabs(m[15] - 1.0f) < 0.01f)) return true;
-    const float ix = 2.0f * tx + 1.0f, iy = ground[1], iz = 2.0f * ty + 1.0f;
+    // The tile is a grid point; the renderer draws ground at height h shifted by h * sqrt(3/2) along both axes (LookAt is a render point).
+    constexpr float kShear = 1.22474487139f;
+    const float iy = ground[1], ix = 2.0f * tx + 1.0f + iy * kShear, iz = 2.0f * ty + 1.0f + iy * kShear;
     const float vx = ix * m[0] + iy * m[4] + iz * m[8] + m[12];
     const float vy = ix * m[1] + iy * m[5] + iz * m[9] + m[13];
     const float vz = ix * m[2] + iy * m[6] + iz * m[10] + m[14];

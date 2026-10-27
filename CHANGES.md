@@ -31,7 +31,7 @@ Bodies are unit type 1 (NPCs and monsters share that hash). Dead modes 0 and 12 
 skipped. Height comes from the MonStats row (`pixHeight * 0.10` when that byte is in
 20..200, otherwise 7). Radius comes from the footprint bytes, clamped to 1.5..3.5.
 Feet Y is the hero's ground (the path has no elevation). Capsules sit at the unit's grid
-place sheared up by that floor's height, where the picture draws it; see section 8 (the camera's
+place sheared up by that floor's height, where the picture draws it; see section 9 (the camera's
 look-at is NOT on the grid on raised ground, and the ray is handed to the game along the old
 isometric line).
 
@@ -98,6 +98,12 @@ while our camera is on, so the original view is unchanged. A read that fails lea
 On a monitor the label-size hooks never installed (those run for the VR floor's own size), so
 this layout hook is installed on its own for flat first and third person.
 
+The ground point is placed with the renderer's elevation shear: a tile is a grid point, and
+ground at height h is drawn shifted by h * sqrt(3/2) along both horizontal axes. Without it the
+test was only right at height 0; on lowered or raised ground (stairs, ledges, act 2 lower
+levels) names of items that were really on screen were dropped from some viewing directions.
+Verified in game on lowered ground: names show from every side with Alt held, as on level 0.
+
 File: `vr/vrcam.cpp` (`ItemLabelOnScreen`, `InstallLabelHooks`).
 
 ## 5. Effects on the horizon
@@ -107,11 +113,6 @@ behind them. The fog pass uses that depth. On the horizon the ground is at the e
 fog, so the mix becomes pure fog colour and the effect is erased. The further that
 background is, the more of the effect goes. High in the sky there is no depth, and the
 effect stays.
-
-Two earlier tries did not change the picture. `[fog] spare_effects=1` on the monitor never
-copied the game's transparent targets (the three-target set was not seen, so the spare
-stayed off). Keeping a bright pixel in the void branch only runs where the depth buffer is
-empty, and the horizon strip is not empty.
 
 The mix that does run there now puts the light back on top of the fog, and only when the
 pixel is bright. The same band as over the void, a peak channel from 0.45 to 0.85.
@@ -173,25 +174,6 @@ chunks across all 12 mesh renderers in
   - Use `fx_mesh_townportal_lip_crawl_v4.model` and `fx_mesh_portalsphere_innerflow_3.model`,
     which only play during the portal closing animation.
 
-### Earlier attempts that did not work
-
-- **Rotating the skeleton (`vr/skeletons.cpp`) or overriding the camera quaternion (`45°`)**:
-  rotating the skeleton moved the view-facing ring the wrong way; overriding the camera
-  quaternion did nothing because PopcornFX billboards read the view matrix.
-- **Painting over the centre in `D2R_DepthFog.fx`**: four versions tested (05:52–06:30);
-  screen-space projection missed once the view turned, depth-keyed masking left the blue-lit
-  half of the oval, and widening to blue ate into the ring.
-- **Returning `nullptr` from `RoofMaterialBuild` (`0xF99C40`)**: crashed at
-  `D2R.exe+0x1006C79` reading `+0x1B00` of the null material pointer.
-- **Passing an empty model name `""` to `RoofMaterialBuild` or overriding Granny material
-  members in `HookFind` (`0x16153A0`)**: no crash, but no visual effect. Every VFX `.model`
-  only carries Maya's default placeholder material (`mat='lambert1'`, `mapCount=0`), while the
-  PopcornFX particle layer supplies its own `.pkma` shader and uses only the mesh geometry.
-- **Zeroing only the CPU `GrannyMesh` buffers inside `HookBuild`**: `HookBuild` (`0xF99C40`)
-  is called at `RVA 0xFA17A8` at the very end of the mesh-creation function
-  (`0xF9E820..0xFA19E8`), after the GPU vertex/index buffers and the runtime `D2RRenderMesh`
-  struct have already been populated from `GrannyMesh`.
-
 ### What was changed (the working fix)
 
 Controlled by `[input] portal_face=1` (default on in flat F2/F3 only — not isometric F1).
@@ -235,15 +217,7 @@ vertex buffers are no longer wiped (that made F1 stay empty after a visit to F2/
 Files: `vr/portal_hole.h`, `vr/portal_hole.cpp`, `vr/roof_sides.h`, `vr/roof_sides.cpp`,
 `vr/vrcam.cpp`, `CMakeLists.txt`, `d2r_vr.ini`.
 
-### Ring cover — abandoned (2026-10-19)
-
-The hole-cover and ring-cover shaders are not in the live effect. The ring is additive VFX
-without its own depth, so a depth-keyed inpaint never matched once the oval was gone. Copies
-remain in `build/Release/` (`D2R_DepthFog_portal_cover.fx`, `_wide`, `_ring`, `_ring_wide`).
-The live `reshade/D2R_DepthFog.fx` has no `PortalCover`. The DLL does not feed `PortalN`.
-The oval collapse above is unchanged.
-
-## 7b. Sky stuck on act 1 panorama (2026-10-19)
+## 7. Sky stuck on act 1 panorama
 
 ReShade's addon API could not find the `SkyTex` uniform on the live effect
 (`SkyTex not found … value not set`) while `GameBarOn` still worked, so the slot stayed
@@ -251,13 +225,7 @@ on act 1's panorama. Fix: rename the uniform to `VrSkyAct` in `D2R_DepthFog.fx`,
 each act its own default `#define` paths (the old effect pointed ACT2–SNOW at act1.png),
 and fall back to enumerating uniforms if `find` misses.
 
-Do **not** mass-call `set_preprocessor_definition_for_effect` for all six painted slots
-when the biome changes. That path (added briefly as a workaround) hung ReShade after F3
-(`sky picture D2R_SKY_ACT1` … `SNOW` then presents/s collapsed). With `VrSkyAct` present
-the DLL only sets the float. If both uniforms are missing, only ACT1's four paths are
-aliased to the live act.
-
-## 7a. NPC dialogue aims the look by the NPC's face (flat F3)
+## 8. NPC dialogue aims the look by the NPC's face (flat F3)
 
 When `NpcDialogPanel` opens in flat first person and the player was looking down, the
 options sit on the NPC's face. `[input] npc_look_horizon=1` (default on) sets the mouse
@@ -274,7 +242,7 @@ How the pitch is found:
    otherwise the nearest monster within 14 units is taken, so a mercenary or a minion standing
    nearer no longer takes the dialogue. The log says `clicked` or `nearest`.
 2. **Where the face is.** MonStats height × 0.90 above the hero's floor, at the NPC's grid place
-   (the hero's grid place is `look-at - L.y * k`, section 8). The distance is taken along the
+   (the hero's grid place is `look-at - L.y * k`, section 9). The distance is taken along the
    camera's horizontal heading, so an NPC standing to the side does not change the picture's
    height.
 3. **The pitch.** The face is `a = atan((eyeY - faceY) / depth)` below the horizon. A view axis
@@ -283,9 +251,7 @@ How the pitch is found:
    is the live projection's (`1 / M[5]`), so it holds for any `[camera] fov` and window shape.
    The result is clamped to ±40°.
 
-This replaces the first version (2026-10-19: the nearest monster, an upper-chest point and fixed
-`-8° +6°` offsets), which did not scale with the field of view or the distance. Unknown pose
-still looks 6° down. Confirmed in play for most town NPCs (2026-10-26).
+Unknown pose still looks 6° down. Confirmed in play for most town NPCs (2026-10-26).
 
 Known limits: the NPC's floor is taken as the hero's (an NPC on another level, or a floating one
 such as Tyrael, has its face higher or lower than computed). The position of the options panel
@@ -295,14 +261,7 @@ eyes; the dialogue text box is fixed in the middle. Neither is changed here.
 
 Files: `vr/gamestate.cpp`, `vr/flat_pick.cpp`, `vr/flat_pick.h`, `vr/vrcam.cpp`, `d2r_vr.ini`.
 
-## 7. Walking into a portal — removed (2026-10-19)
-
-Auto use on walk-in (`[input] portal_walk_in`, map-click / walk-to-unit) was tried and
-worked for the teleport, but left edge cases around the client's left-button latch after
-area changes. Removed: portals are used by a click again. The oval collapse (§6) stays,
-now gated to flat F2/F3 only (`g_enabled`), so isometric F1 keeps the game's black centre.
-
-## 8. Picking, casting and aiming on raised ground (stairs, platforms, caves)
+## 9. Picking, casting and aiming on raised ground (stairs, platforms, caves)
 
 On ground above height 0 (stairs, a platform, a cave floor: the hero's floor was 33.7 world
 units in the Act 2 palace and the Act 4 fortress where this was measured) flat first and third
@@ -368,7 +327,7 @@ with the crosshair on his body, and other NPCs and monsters are still selected.
 
 Files: `vr/flat_pick.cpp` (`Adjust`), `vr/vrcam.cpp` (`FlatHoverProbe`), `vr/flat_pick.h`.
 
-## 9. Ground patches sliding with the camera on raised / lowered ground (2026-10-27)
+## 10. Ground patches sliding with the camera on raised / lowered ground (2026-10-27)
 
 In flat F2 / F3, on ground below or above level 0 (the act 2 Far Oasis stairs between rock shelves were
 the test place), dark mud patches with cracked earth and bumpy "stones" slid over the ground while the
