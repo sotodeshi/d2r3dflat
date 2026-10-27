@@ -257,17 +257,43 @@ when the biome changes. That path (added briefly as a workaround) hung ReShade a
 the DLL only sets the float. If both uniforms are missing, only ACT1's four paths are
 aliased to the live act.
 
-## 7a. NPC dialogue aims the look by height (flat F3)
+## 7a. NPC dialogue aims the look by the NPC's face (flat F3)
 
 When `NpcDialogPanel` opens in flat first person and the player was looking down, the
 options sit on the NPC's face. `[input] npc_look_horizon=1` (default on) sets the mouse
-pitch once from the nearest monster's MonStats height (read-only hash walk; do not call
-`HoverUnit` from the present thread — that crashed on F3): aim at the upper chest with a
-small upward clear, then +6° look-down for every NPC so the dialogue sits above short and
-tall ones. Unknown pose uses the same +6°. Confirmed good for most town NPCs (2026-10-19).
-F1 / F2 unchanged. `0` leaves the pitch alone.
+pitch once, at the moment the panel opens, so that the NPC's face lands at a chosen height of
+the screen (`[input] npc_face_y`, default `0.30` = upper third, fraction of the screen height
+from the top). `0` for `npc_look_horizon` leaves the pitch alone. F1 / F2 unchanged.
 
-Files: `vr/gamestate.cpp`, `vr/flat_pick.cpp`, `vr/vrcam.cpp`, `d2r_vr.ini`.
+How the pitch is found:
+
+1. **Who the dialogue is with.** `HookMapClick` remembers the unit the game found under the
+   pointer at the click (unit type 1, monster / NPC; `HoverUnit` is called on the mouse thread,
+   never on the present thread — that crashed on F3). When the panel opens, that unit is used
+   if the click was less than 30 s ago and its memory still reads as a live monster. Only
+   otherwise the nearest monster within 14 units is taken, so a mercenary or a minion standing
+   nearer no longer takes the dialogue. The log says `clicked` or `nearest`.
+2. **Where the face is.** MonStats height × 0.90 above the hero's floor, at the NPC's grid place
+   (the hero's grid place is `look-at - L.y * k`, section 8). The distance is taken along the
+   camera's horizontal heading, so an NPC standing to the side does not change the picture's
+   height.
+3. **The pitch.** The face is `a = atan((eyeY - faceY) / depth)` below the horizon. A view axis
+   pitched `p` down puts it at `ndc = tan(p - a) / tan(fov/2)` (+1 = top), so
+   `p = a + atan(ndc · tan(fov/2))` with `ndc = 1 - 2 · npc_face_y`. The vertical field of view
+   is the live projection's (`1 / M[5]`), so it holds for any `[camera] fov` and window shape.
+   The result is clamped to ±40°.
+
+This replaces the first version (2026-10-19: the nearest monster, an upper-chest point and fixed
+`-8° +6°` offsets), which did not scale with the field of view or the distance. Unknown pose
+still looks 6° down. Confirmed in play for most town NPCs (2026-10-26).
+
+Known limits: the NPC's floor is taken as the hero's (an NPC on another level, or a floating one
+such as Tyrael, has its face higher or lower than computed). The position of the options panel
+itself is the game's: it follows the game's own (isometric) projection of the NPC, so it can stand
+left of, over, or right of the NPC depending on where the hero stands, and sometimes covers the
+eyes; the dialogue text box is fixed in the middle. Neither is changed here.
+
+Files: `vr/gamestate.cpp`, `vr/flat_pick.cpp`, `vr/flat_pick.h`, `vr/vrcam.cpp`, `d2r_vr.ini`.
 
 ## 7. Walking into a portal — removed (2026-10-19)
 
@@ -341,3 +367,50 @@ stay on the feet (chests, doors and the stash were confirmed there). Confirmed i
 with the crosshair on his body, and other NPCs and monsters are still selected.
 
 Files: `vr/flat_pick.cpp` (`Adjust`), `vr/vrcam.cpp` (`FlatHoverProbe`), `vr/flat_pick.h`.
+
+## 9. Ground patches sliding with the camera on raised / lowered ground (2026-10-27)
+
+In flat F2 / F3, on ground below or above level 0 (the act 2 Far Oasis stairs between rock shelves were
+the test place), dark mud patches with cracked earth and bumpy "stones" slid over the ground while the
+camera turned: looking up moved them away, looking down moved them closer, turning left moved them to the
+right. They stood still while the camera stood still and when the hero walked. The stones were visible
+only inside the patches. F1 was fine.
+
+What the patches are: not lighting, shadows or decals drawn over the picture. They are material layers of
+the ground's own colour / normal map (a 3888 × 3888 toroidal texture read by the terrain pixel shader
+`a11d8d1c6efd3f33` as t35 / t36). A compute shader (`775c45982728780a`) composes that map one 10-unit tile
+per dispatch, and only while the camera moves. The CPU gives it each layer as a world -> layer matrix in b7
+(rows: x, `(0, 1, 0, 0)`, z, translation with `w = 1`; row 0 `.xy` is the tile, row 24 `.y` its texels a
+side, 216). The "stones" are the normal map of such a layer.
+
+Measured (556 camera poses in F2 matched to the same layers in F1, `[debug] layer_log`): every layer of a
+frame is shifted by the same vector
+
+    offset = h * (k - 4 * fwd.y * fwd.xz)          (x and z apart)
+
+with `h` the ground's height (here the hero's ground, `LookAt.y = -22.97`), `fwd` the camera's view
+direction as the same dispatch gets it (b10 row 2), and `k = 1.224745` the isometric shear the terrain
+geometry uses. z axis: `-28.02 + 92.48 * fy * fz`, rms 1.0 unit (`h * k = -28.13`). The game derives the
+layers' shear from the camera direction and assumes its own isometric camera: for `fwd = (-0.612, -0.5,
+-0.612)` the bracket is exactly 0. With a free camera it is not, so on any ground with `h != 0` the layers
+move with every turn of the view. On level 0 nothing moves, which is why the patches were seen only on
+stairs, ledges and lowered areas.
+
+Fix: `[render] ground_layer_fix=1` (default on). When the game binds a compute root constant buffer
+(camfix's existing `SetComputeRootConstantBufferView` hook, the one that already writes the depth range),
+the register is looked up through the root signature: b10 is remembered for the list, and a b7 that has the
+ground map's shape gets every layer's translation moved back by `-offset` (`tu += a * ox + b * oz`, the same
+for `tv`), in the game's upload memory, before the GPU reads it. A buffer already put right (hash of its
+contents) is left alone. Only while our camera is on and `h` is not 0. In play the patches stay put while
+the camera turns; logged after the fix, the layers lie where the game's camera has them within 0.1 unit.
+
+Known limit: `h` is the ground under the hero. A layer on another level than the hero's (a ledge seen from
+below) is moved by the hero's height, not its own. The clean fix would give the game's layer code the
+isometric direction, but that code does not go through the camera functions we hook (`GetProjection` /
+`RebuildView` callers were logged: the same seven with the camera still and turning).
+
+Files: `vr/vrcam.cpp` (`groundfix`, `camfix::GroundLayers`, `VrFrame` height, ini key), `vr/uitrace.cpp`
+(`CbRegister`; investigation tools: `ui_trace_srv`, `layer_log`, per-pass copies, compute constants),
+`cleanroom/camera/d2rcam.{h,cpp}` (diagnostics: `keep_game_pose`, `cull_scale`, `cull_fov`,
+`cam_fields_log`, `cam_callers_log`), `d2r_vr.ini`. Investigation notes and the ruled-out list:
+`PRZEKAZANIE.md`; diagnostic keys: `INI_ADDED.md`.

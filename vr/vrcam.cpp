@@ -100,7 +100,7 @@ int FindHeroMatrices(const float hero[3], uintptr_t* out, int max);
 #include "aim_source.h"    // where a staff's aim comes from: the controllers, never the weapon as drawn
 #include "hold.h"
 #include "writewatch.h"
-namespace uitrace { void Register(bool trace, bool skip, bool depthViaReShade); bool Arm(const std::wstring& path); bool Busy(); void SetSkip(uint64_t pipe); void SetSkipShaders(const uint64_t* hashes, int n);
+namespace uitrace { void Register(bool trace, bool skip, bool depthViaReShade, bool srv); bool Arm(const std::wstring& path); bool Busy(); void SetSkip(uint64_t pipe); void SetGeometry(bool on); void SetEachPass(bool on); void SetSrvWatch(const uint64_t* hashes, int n); void SetLayerLog(bool on, void (*log)(const char*)); uint32_t CbRegister(uint64_t layout, uint32_t param); void SetDumpShaders(const uint64_t* hashes, int n, const std::wstring& dir); void SetDumpCompute(bool on); void SetSkipShaders(const uint64_t* hashes, int n);
                     void SetDepthRange(bool on, float range); uint32_t DepthRangeFixes(); int DepthRangeLayouts();
                     bool DepthFixFor(uint64_t layout, uint32_t param); void FixDepthRangeAt(uint8_t* cb); }
 #include "game_hud_shared.h"
@@ -200,7 +200,9 @@ namespace hud { void SetPlateCut(bool want, const int32_t layout[4], float scale
 using namespace D2RL;
 
 namespace {
-namespace depthsrc { void Configure(bool on); void Tick(); }   // [render] depth_fix_mode 2 (further down, beside SkyTick)
+namespace depthsrc { void Configure(bool on, int tests = 0); void Tick(); uint32_t WindowPins(); }   // [render] depth_fix_mode 2 (further down, beside SkyTick)
+namespace frameorder { void Note(char tag); }   // [debug] frame_order_log, beside depthsrc
+namespace groundfix { void SetOn(bool on); void SetHeight(bool valid, float h); uint32_t Fixed(); }   // [render] ground_layer_fix, in camfix's root CBV hook
 namespace gamefog { void SetPoke(const std::wstring& want); }   // [debug] fog_poke, below
 namespace cavelight { void Load(); }   // [cave_light], below
 namespace engitem { void SetWant(const std::wstring& path); void SetBelt(bool on, float up, float ahead, float arc, float scale, float side, float across, float turn, float grabCm, bool grab, const float hold[6]); void SetBallColours(const float (*rgb)[3]); void Frame(bool fullBody); void InstallHook(); float FistCap(int side); bool BeltBusy(int side); }   // [debug] engine_unit, [hands] belt_models, below
@@ -645,6 +647,7 @@ struct Settings {
     std::atomic<int>   solidWalls{1};          // [render] solid_walls: 0 the game's see-through walls, 1 solid but in F1, 2 solid in every view
     std::atomic<bool>  keepRoofs{false};       // [render] keep_roofs: F4 - the game's roof cut-away (fade to 0) answered with 1 (vr/roof_keep.h)
     std::atomic<bool>  roofsTwoSided{false};   // [render] roofs_two_sided: VR - roof materials built double-sided at an area's load (vr/roof_sides.h)
+    std::atomic<bool>  modelLog{false};        // [debug] model_log: the model builder's models, meshes and materials in the log (vr/roof_sides.h)
     std::atomic<bool>  propsOncePair{false};   // [stereo] props_once_a_pair: F4 - partial-ragdoll props stepped in the left pass only (vr/prop_hold.h)
     std::atomic<float> uiShift{0.0f};       // AFR: the HUD moved apart per eye in the shader, % of the half screen; more = nearer
     std::atomic<float> hudTop{0.70f};       // the HUD is looked for below this height (0 top .. 1 bottom)
@@ -1766,6 +1769,7 @@ void LoadSettings() {
     g_set.solidWalls.store(std::clamp((int)IniF(L"render", L"solid_walls", 1.0f), 0, 2));
     g_set.keepRoofs.store(IniB(L"render", L"keep_roofs", false));
     g_set.roofsTwoSided.store(IniB(L"render", L"roofs_two_sided", false));
+    g_set.modelLog.store(IniB(L"debug", L"model_log", false));
     g_set.propsOncePair.store(IniB(L"stereo", L"props_once_a_pair", false));
     g_set.stampPixels.store(IniB(L"stereo", L"stamp_pixels", true));
     g_set.stamps.store(IniB(L"stereo", L"stamps", true));
@@ -1896,6 +1900,27 @@ void LoadSettings() {
         static uint64_t toldSkip = 0;
         const uint64_t skip = wcstoull(sp, nullptr, 16);
         uitrace::SetSkip(skip);
+        uitrace::SetGeometry(IniB(L"debug", L"ui_trace_geometry", false));
+        uitrace::SetLayerLog(IniB(L"debug", L"layer_log", false), &Log);   // [debug] layer_log: the ground map's material layers as they move (with ui_trace)
+        groundfix::SetOn(IniB(L"render", L"ground_layer_fix", true));     // [render] ground_layer_fix: the ground's material layers where the game's own camera has them
+        uitrace::SetEachPass(IniB(L"debug", L"ui_trace_passes", false));
+        {   // [debug] dump_shaders: the shaders (hex, as Ctrl+F10's trace prints "vs" / "ps") written as shader_<hash>.dxbc beside the ini
+            wchar_t ds[512];
+            GetPrivateProfileStringW(L"debug", L"dump_shaders", L"", ds, (DWORD)std::size(ds), g_iniPath);
+            uint64_t dh[16];
+            int nd = 0;
+            for (const wchar_t* q = ds; *q && nd < 16;) {
+                wchar_t* end = nullptr;
+                const uint64_t h = wcstoull(q, &end, 16);
+                if (end == q) { ++q; continue; }
+                if (h) dh[nd++] = h;
+                q = end;
+            }
+            std::wstring dir = g_iniPath;
+            dir.resize(dir.find_last_of(L"\\/") + 1);
+            uitrace::SetDumpShaders(dh, nd, dir);
+            uitrace::SetDumpCompute(IniB(L"debug", L"dump_compute", false));
+        }
         if (skip != toldSkip) { toldSkip = skip; LogF("vrcam: [debug] skip_pipeline %llx", (unsigned long long)skip); }
         // [render] skip_shaders: the game's passes left out for good, by their pixel shader (Ctrl+F10's "ps"),
         // space-separated hex. Empty = none; the default is filled in once one is confirmed.
@@ -1922,7 +1947,10 @@ void LoadSettings() {
         const bool depthFix = depthMode == 1;
         const float depthRange = IniF(L"render", L"depth_range", 1000.0f);
         uitrace::SetDepthRange(depthFix, depthRange);
-        depthsrc::Configure(depthMode == 2);
+        depthsrc::Configure(depthMode == 2, (IniB(L"debug", L"pin_decal_window", false) ? 1 : 0) | (IniB(L"debug", L"kill_decal_layers", false) ? 2 : 0) | (IniB(L"debug", L"no_sun_shadow", false) ? 4 : 0) |
+                                            (IniB(L"debug", L"early_view", false) ? 8 : 0) | (IniB(L"debug", L"frame_order_log", false) ? 16 : 0) |
+                                            (IniB(L"debug", L"one_tile", false) ? 32 : 0) | (IniB(L"debug", L"window_log", false) ? 64 : 0) |
+                                            (IniB(L"debug", L"pin_terrain_window", false) ? 128 : 0));   // [debug] tests on the frame constants: 1 pin the overlay window, 2 no overlay layers, 4 no sun shadows; 8 our view again before the frame is built, 16 log the order, 32 one screen tile, 64 log the windows, 128 pin the terrain map's window
         static int toldDepth = -1;
         static float toldRange = 0.0f;
         static bool toldFixed = false;
@@ -2044,6 +2072,14 @@ void LoadSettings() {
                      : "vrcam: portal axis test off - effects face this camera again ([input] portal_axis=0)");
         d2rcam::SetEffectAxis(axis);
     }
+    {   // [debug] keep_game_pose (test): the camera's pose fields stay the game's, only our matrices are written
+        const bool keep = g_set.platform.load() == 0 && IniB(L"debug", L"keep_game_pose", false);
+        static bool toldKeep = false;
+        if (keep != toldKeep) { toldKeep = keep; Log(keep ? "vrcam: [debug] keep_game_pose on - the camera's position and quaternion stay the game's, our matrices are written" : "vrcam: [debug] keep_game_pose off"); }
+        d2rcam::SetKeepGamePose(keep);
+    }
+    d2rcam::SetCullScale(g_set.platform.load() == 0 ? std::clamp(IniF(L"debug", L"cull_scale", 1.0f), 1.0f, 8.0f) : 1.0f);   // [debug] cull_scale (test): the camera's own orthographic box made larger
+    d2rcam::SetCullFov(g_set.platform.load() == 0 ? std::clamp(IniF(L"debug", L"cull_fov", 0.0f), 0.0f, 150.0f) : 0.0f);   // [debug] cull_fov (test): the camera's own FovDeg replaced
     g_set.inventoryPad.store(IniF(L"input", L"inventory_button", 0.0f) != 0.0f ? 1 : 0);
     if (const bool one = IniF(L"input", L"interact_one_press", 0.0f) != 0.0f; one != g_set.interactOnePress.exchange(one))
         Log(one ? "vrcam: pick up / interact - one target per press (VR first person; [input] interact_one_press)"
@@ -3312,12 +3348,14 @@ V3 Facing(float heading, float down) {
 
 namespace prevscan { void FrameDone(); }
 void VrFrame() {
+    frameorder::Note('S');
     prevscan::FrameDone();
     AfrNextFrame();
     engitem::Frame(g_enabled.load() && FullBody());
     float look[3] = {};
     const int view = ViewNow();
     const bool haveLook = LookAtNow(look);
+    groundfix::SetHeight(haveLook && g_enabled.load(), look[1]);   // [render] ground_layer_fix: the ground's height under the hero (LookAt is the render point)
     const bool bodyPick = g_set.platform.load() == 0 && g_enabled.load()
                           && ((view == 3 && g_set.flatBodyPick.load()) || (view == 2 && g_set.flatBodyPickThird.load()));
     const bool body = bodyPick && !gamestate::MenuOpen() && haveLook;
@@ -7509,6 +7547,7 @@ bool g_dragging = false;
 POINT g_dragLast{};
 
 void MouseTick() {
+    frameorder::Note('M');
     if (!g_enabled.load() || !GameFocused()) { g_dragging = false; return; }
     POINT p{};
     if (!GetCursorPos(&p)) return;
@@ -8264,6 +8303,88 @@ void PairEnd() {
 // device), so a GPU address reads as CPU memory. After the left pass is done on the
 // GPU those buffers are rewritten for the right eye - the view, its inverse, view *
 // projection and its inverse, the camera position - and the lists run again.
+
+// -- [render] ground_layer_fix (2026-10-27): the ground's material layers (mud, cracks, the bumpy stones of its normal map) on raised
+// or lowered ground stay where the game's own camera has them. The ground's colour / normal map is composed by a compute shader
+// (775c45982728780a), one 10-unit tile per dispatch, only while the camera moves; the CPU gives it each layer as a world -> layer
+// matrix in b7 (rows: x, (0, 1, 0, 0), z, translation with w = 1). Those layers come shifted by h * (k - 4 * fwd.y * fwd.xz) on each
+// axis - h the ground's height, fwd the camera's view direction (b10 row 2), k = 1.224745 the isometric shear the terrain itself
+// uses: the game derives the layers' shear from the camera, assuming its own isometric one (fwd -0.612, -0.5, -0.612: the bracket
+// is 0). With ours the bracket is not 0, so on ground below or above 0 the patches slid with every turn of the camera
+// (`[debug] layer_log`: 556 views fitted with rms 1 unit; with the fix the layers lie where the game's camera has them within
+// 0.1). Each layer is moved back by that much in the game's upload memory as the buffer is bound, before the GPU reads it; a
+// buffer already put right (its contents' hash) is left alone. h is the ground under the hero (LookAt is the render point):
+// layers on another level than the hero's are put right by the hero's height, not theirs.
+namespace groundfix {
+std::atomic<bool> g_on{true};
+std::atomic<bool> g_hValid{false};
+std::atomic<float> g_h{0.0f};
+std::atomic<uint32_t> g_fixed{0};
+SRWLOCK g_lock = SRWLOCK_INIT;
+std::unordered_map<uint64_t, uint64_t> g_done;   // b7's GPU address -> the hash of what we left there
+thread_local void* t_list = nullptr;
+thread_local const uint8_t* t_b10 = nullptr;     // this list's compute b10 (CPU address), the last bound
+thread_local uint8_t* t_b7 = nullptr;            // a b7 bound before its b10
+thread_local uint64_t t_b7va = 0;
+constexpr uint32_t kB7Bytes = 25 * 16;
+void SetOn(bool on) { g_on.store(on); }
+void SetHeight(bool valid, float h) { g_h.store(h); g_hValid.store(valid); }
+uint32_t Fixed() { return g_fixed.load(); }
+uint64_t Hash(const void* p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) { h ^= ((const uint8_t*)p)[i]; h *= 1099511628211ull; }
+    return h;
+}
+bool Copy(void* dst, const void* src, size_t n) { __try { memcpy(dst, src, n); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+void Fix(uint64_t va, uint8_t* cb7, const uint8_t* cb10) {
+    const float h = g_h.load(std::memory_order_relaxed);
+    if (std::fabs(h) < 0.01f) return;   // level 0: nothing moved
+    float e[12], f[25 * 4];
+    if (!Copy(e, cb10, sizeof e) || !Copy(f, cb7, kB7Bytes)) return;
+    const float fx = e[8], fy = e[9], fz = e[10];
+    if (!(std::fabs(fx) <= 1.01f && std::fabs(fy) <= 1.01f && std::fabs(fz) <= 1.01f)) return;
+    {
+        AcquireSRWLockShared(&g_lock);
+        auto it = g_done.find(va);
+        const bool done = it != g_done.end() && it->second == Hash(f, kB7Bytes);
+        ReleaseSRWLockShared(&g_lock);
+        if (done) return;
+    }
+    constexpr double k = 1.224745;
+    const double ox = h * (k - 4.0 * fy * fx), oz = h * (k - 4.0 * fy * fz);
+    bool any = false;
+    for (int r = 1; r + 3 <= 24; ++r) {
+        float *m5 = f + r * 4, *m6 = f + (r + 1) * 4, *m7 = f + (r + 2) * 4, *m8 = f + (r + 3) * 4;
+        if (m6[1] != 1.0f || m8[3] != 1.0f || (m5[0] == 0.0f && m5[2] == 0.0f)) continue;
+        // u = a x + b z + tu: the layer moved by -o has tu' = tu + a ox + b oz (and so for v)
+        m8[0] = (float)(m8[0] + m5[0] * ox + m7[0] * oz);
+        m8[2] = (float)(m8[2] + m5[2] * ox + m7[2] * oz);
+        any = true;
+        r += 3;
+    }
+    if (!any || !Copy(cb7, f, kB7Bytes)) return;
+    g_fixed.fetch_add(1, std::memory_order_relaxed);
+    AcquireSRWLockExclusive(&g_lock);
+    if (g_done.size() > 65536) g_done.clear();
+    g_done[va] = Hash(f, kB7Bytes);
+    ReleaseSRWLockExclusive(&g_lock);
+}
+// A compute root CBV bound (camfix's hook): reg = its register + 1 (8 = b7, 11 = b10), cpu its upload memory.
+void Bound(void* list, uint32_t reg, uint64_t va, uint8_t* cpu, uint64_t room) {
+    if (t_list != list) { t_list = list; t_b10 = nullptr; t_b7 = nullptr; }
+    if (reg == 11 && room >= 3 * 16) {
+        t_b10 = cpu;
+        if (t_b7) { Fix(t_b7va, t_b7, t_b10); t_b7 = nullptr; }
+    } else if (reg == 8 && room >= kB7Bytes) {
+        // the ground map's tile: b7 row 24 .y is its texels a side (an integer, 216 in act 2), row 0 .xy the tile (integers)
+        int32_t texels = 0;
+        if (!Copy(&texels, cpu + 24 * 16 + 4, 4) || texels < 16 || texels > 4096) return;
+        if (t_b10) Fix(va, cpu, t_b10);
+        else { t_b7 = cpu; t_b7va = va; }
+    }
+}
+}  // namespace groundfix
+
 namespace camfix {
 using namespace reshade::api;
 struct Upload { uint64_t va, size; uint8_t* cpu; uint64_t res; };
@@ -8709,8 +8830,19 @@ template <int S> void STDMETHODCALLTYPE HookSetGfxCBV(ID3D12GraphicsCommandList*
     const uint64_t to = Note(0, cl, p, va);
     OrigSetGfxCBV[S](cl, p, to ? to : va);
 }
+// [render] ground_layer_fix: the ground map's compute is told b10 (the view) and b7 (its layers) - see groundfix
+void GroundLayers(ID3D12GraphicsCommandList* cl, UINT param, uint64_t va) {
+    if (!groundfix::g_on.load(std::memory_order_relaxed) || !groundfix::g_hValid.load(std::memory_order_relaxed) || !va) return;
+    ID3D12RootSignature* rs = t_list == cl ? t_rs[1] : nullptr;
+    if (!rs) return;
+    const uint32_t reg = uitrace::CbRegister((uint64_t)(uintptr_t)rs, param);
+    if (reg != 8 && reg != 11) return;
+    uint64_t room = 0;
+    if (uint8_t* cpu = Cpu(va, &room)) groundfix::Bound(cl, reg, va, cpu, room);
+}
 template <int S> void STDMETHODCALLTYPE HookSetCompCBV(ID3D12GraphicsCommandList* cl, UINT p, D3D12_GPU_VIRTUAL_ADDRESS va) {
     DepthRange(1, cl, p, va);
+    GroundLayers(cl, p, va);
     const uint64_t to = Note(1, cl, p, va);
     OrigSetCompCBV[S](cl, p, to ? to : va);
 }
@@ -14801,6 +14933,39 @@ int Lights(Light* out) {
 }
 }  // namespace worldobj
 
+// -- [debug] frame_order_log (test, 2026-10-27): which of our frame sync ('S', after the game's camera tick), the game's frame builder
+// ('B', depthsrc's hook; '+' = early_view refreshed our view there) and MouseTick ('M') come first, and on which thread. The ground
+// decals reach the terrain shader in view space; if they are built before 'S' they carry the last frame's view and slide while turning.
+// 48 events once, then again after each ini save that turns it on.
+namespace frameorder {
+std::atomic<bool> g_on{false};
+std::atomic<int> g_n{0};
+struct Ev { char tag; DWORD tid; LONGLONG t; };
+Ev g_ev[48];
+void Arm(bool on) {
+    if (on && !g_on.load()) g_n.store(0);
+    g_on.store(on);
+}
+void Note(char tag) {
+    if (!g_on.load(std::memory_order_relaxed)) return;
+    const int i = g_n.fetch_add(1, std::memory_order_relaxed);
+    if (i >= (int)std::size(g_ev)) return;
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    g_ev[i] = {tag, GetCurrentThreadId(), q.QuadPart};
+    if (i + 1 < (int)std::size(g_ev)) return;
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    char line[2048];
+    int len = 0;
+    for (const Ev& e : g_ev) {
+        len += snprintf(line + len, sizeof line - len, " %c%lu@%.2f", e.tag, (unsigned long)e.tid, (double)(e.t - g_ev[0].t) * 1000.0 / (double)f.QuadPart);
+        if (len >= (int)sizeof line - 32) break;
+    }
+    LogF("vrcam: [debug] frame_order_log (tag thread @ms):%s", line);
+}
+}  // namespace frameorder
+
 // -- [render] depth_fix_mode 2: the game's depth range at its source (vr/depth_source.h) ---------------------------------------
 // After the game's frame-constant builder (BuildFrame 0xE3B590: renderer, frame, camera, time) this frame's upload memory holds
 // word 53 (renderer +0x11BB8 -> +0x350) and the camera constants (renderer +0x11A08 -> +0xD0: the projection uploaded for our
@@ -14818,15 +14983,128 @@ const uint8_t kSigFrameStore[7] = {0x0F,0x11,0x87,0x50,0x03,0x00,0x00};         
 using BuildFrameFn = void (*)(void* renderer, void* frame, void* camera, float time);
 BuildFrameFn Orig = nullptr;
 std::atomic<bool> g_on{false};
-std::atomic<uint32_t> g_written{0}, g_writtenEver{0}, g_notOurs{0}, g_unread{0}, g_notRange{0};
+std::atomic<int> g_pin{0};   // [debug] tests written into the frame constants at the same place: 1 pin_decal_window (PinWindow), 2 kill_decal_layers (KillLayers)
+std::atomic<uint32_t> g_written{0}, g_writtenEver{0}, g_notOurs{0}, g_unread{0}, g_notRange{0}, g_pinned{0};
 bool g_in = false, g_failed = false;
+bool g_wantDepth = false; int g_wantPin = 0;   // what Configure was last asked (LoadSettings runs at the start and on an ini save; Tick asks again)
+void Configure(bool on, int tests);
+
+// b10 word 47 = (0, 1, ox, oz): the origin of the 180-unit window the ground overlay (patches, grass tint) is read through. In the
+// 2026-10-27 traces it moved with where the camera looked ((9020, 10040) looking down, (8990, 9990) up, the eye unchanged). Pinned to
+// the window centred on the eye (b10[1] x, z), rounded to 10 like the game's: the same whatever the view. Only a row of that shape.
+void PinWindow(uintptr_t constants) {
+    float eye[4], row[4];
+    if (!SafeRead(eye, reinterpret_cast<void*>(constants + 1 * 16), sizeof eye) || !SafeRead(row, reinterpret_cast<void*>(constants + 47 * 16), sizeof row)) return;
+    if (!(row[0] == 0.0f && row[1] == 1.0f && row[2] > 1000.0f && row[3] > 1000.0f && eye[0] > 1000.0f && eye[2] > 1000.0f)) return;
+    const float zw[2] = {std::floor(eye[0] / 10.0f) * 10.0f - 90.0f, std::floor(eye[2] / 10.0f) * 10.0f - 90.0f};
+    if (row[2] == zw[0] && row[3] == zw[1]) return;
+    if (SafeWriteMem(reinterpret_cast<void*>(constants + 47 * 16 + 8), zw, sizeof zw)) g_pinned.fetch_add(1, std::memory_order_relaxed);
+}
+
+// [debug] kill_decal_layers (test): the ground overlay's pixel shader (the patches, the grass tint) lays a layer where  h < y < h + range,
+// the range and the base from b10[69 + layer] .x .y .w (2026-10-27, df7d377's disassembly). Those fields zeroed here, the test never
+// passes: the overlay is gone and nothing else is touched - if the patches vanish, they are that layer. Rows 69..89 (the buffer's end).
+std::atomic<uint32_t> g_killed{0};
+void KillLayers(uintptr_t constants) {
+    float rows[21 * 4];
+    if (!SafeRead(rows, reinterpret_cast<void*>(constants + 69 * 16), sizeof rows)) return;
+    bool any = false;
+    for (int r = 0; r < 21; ++r)
+        for (int c : {0, 1, 3})
+            if (rows[r * 4 + c] != 0.0f) { rows[r * 4 + c] = 0.0f; any = true; }
+    if (any && SafeWriteMem(reinterpret_cast<void*>(constants + 69 * 16), rows, sizeof rows)) g_killed.fetch_add(1, std::memory_order_relaxed);
+}
+
+// [debug] no_sun_shadow (test): the lit passes sample the shadow maps only when b10[31].w / b10[33].w (the filter mode, an integer: 3 in the
+// 2026-10-27 traces) is above 0 (a11d8d1c's disassembly: ilt 0, cb10[33].w). Both zeroed here once a frame: no sun shadows at all - if the
+// dark patch goes, it is a shadow.
+std::atomic<uint32_t> g_noShadow{0};
+void NoSunShadow(uintptr_t constants) {
+    uint32_t w31 = 0, w33 = 0;
+    if (!SafeRead(&w31, reinterpret_cast<void*>(constants + 31 * 16 + 12), sizeof w31) || !SafeRead(&w33, reinterpret_cast<void*>(constants + 33 * 16 + 12), sizeof w33)) return;
+    if (w31 == 0 && w33 == 0) return;
+    const uint32_t zero = 0;
+    if (w31 <= 8 && SafeWriteMem(reinterpret_cast<void*>(constants + 31 * 16 + 12), &zero, sizeof zero)) g_noShadow.fetch_add(1, std::memory_order_relaxed);
+    if (w33 <= 8) SafeWriteMem(reinterpret_cast<void*>(constants + 33 * 16 + 12), &zero, sizeof zero);
+}
+
+// [debug] one_tile (test): the terrain / props shaders pick their decal and light lists by screen tile, the grid's size in b10[13].zw
+// (integers, a11d8d1c's disassembly). Made 1 x 1 here: every pixel reads tile 0's lists - if the dark patch goes or changes, it is one
+// of those decals or lights.
+std::atomic<uint32_t> g_oneTile{0};
+uint32_t g_tileGrid[2] = {};
+void OneTile(uintptr_t constants) {
+    uint32_t zw[2];
+    if (!SafeRead(zw, reinterpret_cast<void*>(constants + 13 * 16 + 8), sizeof zw)) return;
+    if (zw[0] <= 1 && zw[1] <= 1) return;
+    if (zw[0] > 4096 || zw[1] > 4096) return;
+    g_tileGrid[0] = zw[0]; g_tileGrid[1] = zw[1];
+    const uint32_t one[2] = {1, 1};
+    if (SafeWriteMem(reinterpret_cast<void*>(constants + 13 * 16 + 8), one, sizeof one)) g_oneTile.fetch_add(1, std::memory_order_relaxed);
+}
+
+// [debug] window_log (test): b10 rows 1 (the eye), 3 (.zw: the origin of the terrain colour map's 180-unit window, a11d8d1c reads
+// t35/t36 at (xz - y*k - b10[3].zw) / 180) and 47 (the ground overlay's window) kept for the log every 2 s.
+// [debug] pin_terrain_window (test): b10[3].zw pinned to the window centred on the eye, as PinWindow does for row 47.
+// Besides, every frame whose window (row 3 .zw or row 47 .zw) differs from the last one goes into a ring that Tick writes out:
+// the time, the eye and both windows, so a turn of the mouse shows frame by frame whether the windows travel with it.
+float g_rows[3][4] = {};
+std::atomic<uint32_t> g_rowsSeen{0}, g_terrainPins{0};
+struct RowEv { ULONGLONG t; float eye[3], w3[2], w47[2]; };
+RowEv g_rowEv[512];
+std::atomic<uint32_t> g_rowHead{0};
+uint32_t g_rowTail = 0;
+void KeepRows(uintptr_t constants) {
+    float r[3][4];
+    if (SafeRead(r[0], reinterpret_cast<void*>(constants + 1 * 16), 16) && SafeRead(r[1], reinterpret_cast<void*>(constants + 3 * 16), 16) &&
+        SafeRead(r[2], reinterpret_cast<void*>(constants + 47 * 16), 16)) {
+        const bool moved = r[1][2] != g_rows[1][2] || r[1][3] != g_rows[1][3] || r[2][2] != g_rows[2][2] || r[2][3] != g_rows[2][3];
+        memcpy(g_rows, r, sizeof r);
+        g_rowsSeen.fetch_add(1, std::memory_order_relaxed);
+        if (moved) {
+            const uint32_t h = g_rowHead.load(std::memory_order_relaxed);
+            if (h - g_rowTail < std::size(g_rowEv)) {
+                g_rowEv[h % std::size(g_rowEv)] = {GetTickCount64(), {r[0][0], r[0][1], r[0][2]}, {r[1][2], r[1][3]}, {r[2][2], r[2][3]}};
+                g_rowHead.store(h + 1, std::memory_order_release);
+            }
+        }
+    }
+}
+void PinTerrainWindow(uintptr_t constants) {
+    float eye[4], row[4];
+    if (!SafeRead(eye, reinterpret_cast<void*>(constants + 1 * 16), sizeof eye) || !SafeRead(row, reinterpret_cast<void*>(constants + 3 * 16), sizeof row)) return;
+    if (!(row[2] > 1000.0f && row[3] > 1000.0f && eye[0] > 1000.0f && eye[2] > 1000.0f)) return;
+    const float zw[2] = {std::floor(eye[0] / 10.0f) * 10.0f - 90.0f, std::floor(eye[2] / 10.0f) * 10.0f - 90.0f};
+    if (row[2] == zw[0] && row[3] == zw[1]) return;
+    if (SafeWriteMem(reinterpret_cast<void*>(constants + 3 * 16 + 8), zw, sizeof zw)) g_terrainPins.fetch_add(1, std::memory_order_relaxed);
+}
 
 void Hook(void* renderer, void* frame, void* camera, float time) {
+    {
+        const int tests = g_pin.load(std::memory_order_relaxed);
+        // [debug] early_view (test): our view worked out again from the newest mouse look before the game builds this frame from the camera
+        const bool refreshed = (tests & 8) && g_enabled.load(std::memory_order_relaxed) && g_inWorld.load(std::memory_order_relaxed) && d2rcam::Refresh();
+        if (tests & 16) frameorder::Note(refreshed ? '+' : 'B');
+    }
     Orig(renderer, frame, camera, time);
-    if (!g_on.load(std::memory_order_relaxed) || !renderer || !camera) return;
+    const bool depthOn = g_on.load(std::memory_order_relaxed), pinOn = (g_pin.load(std::memory_order_relaxed) & (1 | 2 | 4 | 32 | 64 | 128)) != 0;
+    if ((!depthOn && !pinOn) || !renderer || !camera) return;
     if (!g_enabled.load(std::memory_order_relaxed) || !g_inWorld.load(std::memory_order_relaxed)) {
         g_notOurs.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
+    if (pinOn) {
+        uintptr_t frameConstants = 0;
+        if (SafeRead(&frameConstants, static_cast<uint8_t*>(renderer) + 0x11BB8, sizeof frameConstants) && frameConstants >= 0x10000) {
+            const int tests = g_pin.load(std::memory_order_relaxed);
+            if (tests & 1) PinWindow(frameConstants);
+            if (tests & 2) KillLayers(frameConstants);
+            if (tests & 4) NoSunShadow(frameConstants);
+            if (tests & 32) OneTile(frameConstants);
+            if (tests & 64) KeepRows(frameConstants);
+            if (tests & 128) PinTerrainWindow(frameConstants);
+        }
+        if (!depthOn) return;
     }
     uintptr_t cameraConstants = 0, constants = 0;
     float projection[16], range[4];
@@ -14852,13 +15130,20 @@ void Hook(void* renderer, void* frame, void* camera, float time) {
              range[2], range[2] + range[0]);
 }
 // Live (mode 2 or not); the hook goes in the first time mode 2 is wanted, after its layout checks.
-void Configure(bool on) {
+void Configure(bool on, int tests) {
     g_on.store(on);
-    if (!on || g_in || g_failed) return;
+    g_pin.store(tests);
+    frameorder::Arm((tests & 16) != 0);
+    g_wantDepth = on; g_wantPin = tests;
+    if (!(on || tests) || g_in || g_failed) return;
     if (!d2rsig::Addr(RVA_BUILD_FRAME)) return;   // (its code may still be encrypted: asked again)
     if (!d2rsig::Check(RVA_FRAME_CAMERA, kSigFrameCamera, sizeof kSigFrameCamera) || !d2rsig::Check(RVA_FRAME_MAP, kSigFrameMap, sizeof kSigFrameMap) ||
         !d2rsig::Check(RVA_FRAME_RANGE, kSigFrameRange, sizeof kSigFrameRange) ||
         !d2rsig::Check(RVA_FRAME_STORE, kSigFrameStore, sizeof kSigFrameStore)) {
+        // Asked at the game's start the code can still be encrypted (2026-10-27: the check ran 1 s before the scan that finds it);
+        // only a check that keeps failing for about 40 s (80 asks, twice a second) is a build that is not this one.
+        static int asks = 0;
+        if (++asks < 80) return;
         g_failed = true;
         Log("vrcam: [render] depth_fix_mode 2 - the game's frame builder is not what 3.3.93787 has: nothing written (mode 1 still works)");
         return;
@@ -14868,10 +15153,50 @@ void Configure(bool on) {
     Log(g_in ? "vrcam: [render] depth_fix_mode 2 - the game's frame builder hooked: the depth range is written once a frame at its source"
              : "vrcam: [render] depth_fix_mode 2 - the game's frame builder could not be hooked: nothing written");
 }
+uint32_t WindowPins() { return g_pinned.load(); }
 // Every 20 s while mode 2 is on: what became of the frames.
 void Tick() {
     static ULONGLONG at = 0;
     const ULONGLONG now = GetTickCount64();
+    static bool toldPin = false;
+    if ((g_wantDepth || g_wantPin != 0) && !g_in && !g_failed) Configure(g_wantDepth, g_wantPin);   // the game's code may have been encrypted when first asked
+    static bool toldShadow = false;
+    if (!toldShadow && g_noShadow.load()) {
+        toldShadow = true;
+        LogF("vrcam: [debug] no_sun_shadow - b10[31].w and b10[33].w (the shadow filter mode) zeroed, %u frames so far", g_noShadow.load());
+    }
+    static bool toldKill = false;
+    if (!toldKill && g_killed.load()) {
+        toldKill = true;
+        LogF("vrcam: [debug] kill_decal_layers - b10 rows 69..89 zeroed (.x .y .w), %u frames so far", g_killed.load());
+    }
+    {
+        static ULONGLONG rowsAt = 0;
+        static uint32_t rowsBefore = 0;
+        const uint32_t seen = g_rowsSeen.load();
+        if (seen != rowsBefore && now - rowsAt >= 2000) {
+            rowsAt = now;
+            rowsBefore = seen;
+            LogF("vrcam: [debug] window_log - b10[1] eye %.2f %.2f %.2f | b10[3] %.4g %.4g %.2f %.2f | b10[47] %.4g %.4g %.2f %.2f | terrain pins %u",
+                 g_rows[0][0], g_rows[0][1], g_rows[0][2], g_rows[1][0], g_rows[1][1], g_rows[1][2], g_rows[1][3],
+                 g_rows[2][0], g_rows[2][1], g_rows[2][2], g_rows[2][3], g_terrainPins.load());
+        }
+        // the windows' changes since the last Tick, one line each (the frame builder's thread only adds, this one only takes)
+        for (const uint32_t h = g_rowHead.load(std::memory_order_acquire); g_rowTail != h; ++g_rowTail) {
+            const RowEv& e = g_rowEv[g_rowTail % std::size(g_rowEv)];
+            LogF("vrcam: [debug] window_log change t=%llu eye %.2f %.2f %.2f | terrain window %.2f %.2f | overlay window %.2f %.2f",
+                 (unsigned long long)e.t, e.eye[0], e.eye[1], e.eye[2], e.w3[0], e.w3[1], e.w47[0], e.w47[1]);
+        }
+    }
+    static bool toldTile = false;
+    if (!toldTile && g_oneTile.load()) {
+        toldTile = true;
+        LogF("vrcam: [debug] one_tile - b10[13].zw (the screen tile grid, the game's %u x %u) made 1 x 1, %u frames so far", g_tileGrid[0], g_tileGrid[1], g_oneTile.load());
+    }
+    if (!toldPin && g_pinned.load()) {
+        toldPin = true;
+        LogF("vrcam: [debug] pin_decal_window - b10[47] (the ground overlay's window) pinned to the eye-centred one, %u frames so far", g_pinned.load());
+    }
     if (!g_on.load() || !g_in || now - at < 20000) return;
     at = now;
     const uint32_t w = g_written.exchange(0), n = g_notOurs.exchange(0), u = g_unread.exchange(0), k = g_notRange.exchange(0);
@@ -14889,6 +15214,32 @@ void SkyTick() {
     worldobj::Gather();
     gamefog::Tick();
     depthsrc::Tick();   // [render] depth_fix_mode 2: what became of the frames, every 20 s
+    {   // [debug] cam_fields_log: the game camera's own fields (type 1 = orthographic, the box AspectW x AspectH), every 3 s
+        static ULONGLONG fieldsAt = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - fieldsAt > 3000) {
+            fieldsAt = now;
+            if (IniB(L"debug", L"cam_fields_log", false))
+                if (const d2rcam::CamFields f = d2rcam::LastFields(); f.valid)
+                    LogF("vrcam: camera fields - type %u fov %.2f aspect %.2f x %.2f near %.3f far %.1f viewport %.0f x %.0f", f.type, f.fov, f.aw, f.ah, f.nearPlane, f.farPlane, f.vw, f.vh);
+        }
+    }
+    {   // [debug] cam_callers_log: which of the game's codes ask the camera for its projection / a view rebuild, every 2 s
+        static ULONGLONG callersAt = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - callersAt > 2000) {
+            callersAt = now;
+            const bool on = IniB(L"debug", L"cam_callers_log", false);
+            d2rcam::SetCallerLog(on);
+            if (on) {
+                char b[1600];
+                d2rcam::CallerReport(b, sizeof b);
+                LogF("vrcam: [debug] cam_callers_log (2 s) - %s", b);
+            }
+            static bool toldGround = false;   // [render] ground_layer_fix: said once, at the first tile put right
+            if (!toldGround && groundfix::Fixed()) { toldGround = true; Log("vrcam: [render] ground_layer_fix - the ground map's material layers put back where the game's camera has them (raised / lowered ground)"); }
+        }
+    }
     static uint32_t seenGen = ~0u;
     static std::string biome;
     static int palette = -1;
@@ -16985,7 +17336,22 @@ void TryRegister() {
         const bool trace = IniB(L"debug", L"ui_trace", false);
         const bool skip = wcstoull(sp, nullptr, 16) != 0 || ss[0] != 0;
         const bool depthViaReShade = !IniB(L"debug", L"replay_proto", true);   // camfix's root CBV hook comes with the replay's
-        uitrace::Register(trace, skip, depthViaReShade);
+        // [debug] ui_trace_srv: pixel shader hashes (hex, space-separated) whose textures the trace lists by register; 1 = the ground's
+        // (terrain a11d8d1c, grass/props df7d377b); 0 / empty = off. Follows every descriptor write of the game, so only with ui_trace.
+        wchar_t sw[256] = L"";
+        GetPrivateProfileStringW(L"debug", L"ui_trace_srv", L"0", sw, (DWORD)std::size(sw), g_iniPath);
+        uint64_t srvHashes[8];
+        int srvN = 0;
+        if (wcscmp(sw, L"1") == 0) { srvHashes[srvN++] = 0xa11d8d1c6efd3f33ull; srvHashes[srvN++] = 0xdf7d377bda243447ull; srvHashes[srvN++] = 0x775c45982728780aull; }   // (+ the ground map's compute: its constants at each dispatch)
+        else for (const wchar_t* q = sw; *q && srvN < 8;) {
+            wchar_t* end = nullptr;
+            const uint64_t h = wcstoull(q, &end, 16);
+            if (end == q) { ++q; continue; }
+            if (h > 1) srvHashes[srvN++] = h;
+            q = end;
+        }
+        uitrace::SetSrvWatch(srvHashes, srvN);
+        uitrace::Register(trace, skip, depthViaReShade, srvN > 0);
         LogF("vrcam: the game's draws watched by ReShade events: %s%s%s", trace ? "the Ctrl+F10 trace's ([debug] ui_trace) " : "",
              skip ? "draws and pipelines (skip_shaders / skip_pipeline) " : "", depthViaReShade ? "root CBVs for depth_fix " : "",
              (!trace && !skip && !depthViaReShade) ? "none (the pipelines' creation only)" : "");
@@ -17326,7 +17692,8 @@ DWORD WINAPI UpdateThread(void*) {
                 const int hole = (g_set.platform.load() == 0 && g_enabled.load()) ? g_set.portalFace.load() : 0;
                 portalhole::Configure(hole, &Log);
                 roofsides::WatchModels(&portalhole::OnModel);
-                if (g_set.roofsTwoSided.load() || hole)
+                roofsides::LogModels(g_set.modelLog.load());
+                if (g_set.roofsTwoSided.load() || hole || g_set.modelLog.load())
                     roofsides::Install(&Log, +[]() { return g_set.roofsTwoSided.load(std::memory_order_relaxed) && g_set.platform.load() == 1; });
             }
             prophook::Install();   // only once [stereo] props_once_a_pair asks for it

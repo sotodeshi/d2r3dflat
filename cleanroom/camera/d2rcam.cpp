@@ -30,6 +30,7 @@
 
 #include <Windows.h>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <intrin.h>
 
@@ -63,12 +64,32 @@ ReleaseCameraFn o_releaseCamera = nullptr;
 std::atomic<bool>   g_cameraHooks { false };
 std::atomic<bool>   g_enabled { false };
 std::atomic<bool>   g_effectAxis { false };   // [input] portal_axis: quat is the old 45 degree aim, matrices stay the real view
+std::atomic<float>  g_cullScale { 1.0f };   // [debug] cull_scale: the orthographic box fields AspectW/H scaled after our frame sync
+float               g_origW = 0.0f, g_origH = 0.0f, g_wroteW = 0.0f, g_wroteH = 0.0f;   // the game's own values and what we last wrote (frame sync thread)
+std::atomic<float>  g_cullFov { 0.0f };   // [debug] cull_fov: the field FovDeg (3.44 degrees: the game's long lens) replaced by this after our frame sync
+float               g_origFov = 0.0f, g_wroteFov = 0.0f;
+CamFields           g_fields {};
+std::atomic<bool>   g_keepGamePose { false };   // [debug] keep_game_pose: only the matrices are ours, the pose fields stay the game's
 std::atomic<ViewFn> g_viewFn { nullptr };
 std::atomic<ProjFn> g_projFn { nullptr };
 std::atomic<FrameFn> g_frameFn { nullptr };
 std::atomic<RayFn>  g_rayFn { nullptr };
 std::atomic<RayAdjustFn> g_rayAdjust { nullptr };
 std::atomic<ULONGLONG> g_lastSync { 0 };
+
+// [debug] cam_callers_log: the game's codes that ask the camera for its projection (GetProjection) or make it rebuild its view
+// (RebuildView), by return address as an RVA, counted - to find which of them places the ground's material layers (2026-10-27).
+constexpr int kCallerSlots = 48;
+std::atomic<bool>      g_callerLog { false };
+std::atomic<uintptr_t> g_callerRva[2][kCallerSlots] {};
+std::atomic<uint32_t>  g_callerN[2][kCallerSlots] {};
+void NoteCaller(int kind, uintptr_t rva) {
+	for (int i = 0; i < kCallerSlots; ++i) {
+		uintptr_t have = g_callerRva[kind][i].load(std::memory_order_relaxed);
+		if (have == 0 && g_callerRva[kind][i].compare_exchange_strong(have, rva)) have = rva;
+		if (have == rva) { g_callerN[kind][i].fetch_add(1, std::memory_order_relaxed); return; }
+	}
+}
 
 // ---- Per-frame snapshot ----------------------------------------------------
 // Written only by the frame sync (game main thread), read by the hooks and
@@ -213,6 +234,35 @@ void SyncFrame() {
 		return;
 	}
 
+	// [debug] cull_scale: the game's own orthographic box (AspectW/H) is scaled for everything that reads it later this frame (culling of
+	// decals / models by the old isometric view) and put back here, so the callbacks and the game's follow see its own values.
+	{
+		float& aw = At<float>(cam, camf::AspectW);
+		float& ah = At<float>(cam, camf::AspectH);
+		if (g_wroteW != 0.0f && aw == g_wroteW && ah == g_wroteH) {
+			aw = g_origW;
+			ah = g_origH;
+		}
+		{
+			float& fv = At<float>(cam, camf::FovDeg);
+			if (g_wroteFov != 0.0f && fv == g_wroteFov) fv = g_origFov;
+			g_origFov = fv;
+			g_wroteFov = 0.0f;
+		}
+		g_origW = aw;
+		g_origH = ah;
+		g_wroteW = g_wroteH = 0.0f;
+		g_fields.type = At<uint32_t>(cam, camf::ProjType);
+		g_fields.fov  = At<float>(cam, camf::FovDeg);
+		g_fields.aw   = aw;
+		g_fields.ah   = ah;
+		g_fields.nearPlane = At<float>(cam, camf::Near);
+		g_fields.farPlane  = At<float>(cam, camf::Far);
+		g_fields.vw   = At<float>(cam, camf::ViewportW);
+		g_fields.vh   = At<float>(cam, camf::ViewportH);
+		g_fields.valid = true;
+	}
+
 	// 1. The game's own pose this frame.
 	float* pos  = Fp(cam, camf::Pos);
 	float* quat = Fp(cam, camf::Quat);
@@ -238,6 +288,11 @@ void SyncFrame() {
 		frameFn();
 	}
 	Apply(cam, in, hadView, hadProj);
+	if (const float f = g_cullFov.load(std::memory_order_relaxed); g_enabled.load(std::memory_order_relaxed) && f > 1.0f && g_origFov > 0.0f) At<float>(cam, camf::FovDeg) = g_wroteFov = f;   // [debug] cull_fov
+	if (const float s = g_cullScale.load(std::memory_order_relaxed); g_enabled.load(std::memory_order_relaxed) && s > 1.001f && g_origW > 0.0f && g_origH > 0.0f) {   // [debug] cull_scale
+		At<float>(cam, camf::AspectW) = g_wroteW = g_origW * s;
+		At<float>(cam, camf::AspectH) = g_wroteH = g_origH * s;
+	}
 }
 
 // 3. Runs the callbacks on `in` and puts their matrices into the camera.
@@ -275,11 +330,15 @@ void Apply(void* cam, const WorldView& in, bool hadView, bool hadProj) {
 			q[3] = 0.9238795f;
 		}
 		const float p[3] { eye.x, eye.y, eye.z };
-		std::memcpy(pos, p, sizeof(p));
-		std::memcpy(quat, q, sizeof(q));
-		std::memcpy(g_t.writtenPos, p, sizeof(p));
-		std::memcpy(g_t.writtenQuat, q, sizeof(q));
-		g_t.wrotePose = true;
+		if (!g_keepGamePose.load(std::memory_order_relaxed)) {
+			std::memcpy(pos, p, sizeof(p));
+			std::memcpy(quat, q, sizeof(q));
+			std::memcpy(g_t.writtenPos, p, sizeof(p));
+			std::memcpy(g_t.writtenQuat, q, sizeof(q));
+			g_t.wrotePose = true;
+		} else if (g_t.wrotePose) {
+			RestoreGamePose(cam);   // [debug] keep_game_pose was switched on while our pose was in the fields
+		}
 		o_rebuildView(cam);   // keeps the game's own bookkeeping (dirty flag) straight
 		std::memcpy(Fp(cam, camf::View), view, sizeof(view));
 		std::memcpy(Fp(cam, camf::InvView), inv, sizeof(inv));
@@ -344,6 +403,7 @@ void __fastcall HookCamRenderTick(void* layer, float dt) {
 }
 
 void __fastcall HookRebuildView(void* cam) {
+	if (g_callerLog.load(std::memory_order_relaxed)) NoteCaller(1, reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base);
 	if (const RebuildViewFn original = Orig(o_rebuildView)) {
 		original(cam);
 	}
@@ -355,6 +415,7 @@ void __fastcall HookRebuildView(void* cam) {
 }
 
 const float* __fastcall HookGetProjection(void* cam) {
+	if (g_callerLog.load(std::memory_order_relaxed)) NoteCaller(0, reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base);
 	const GetProjectionFn original = Orig(o_getProjection);
 	const float* result = original != nullptr ? original(cam) : Fp(cam, camf::Proj);
 	const Frame& f = Current();
@@ -475,6 +536,10 @@ bool Install(const D2RL::PluginContext* ctx) {
 
 void SetEnabled(bool on) { g_enabled.store(on); }
 void SetEffectAxis(bool on) { g_effectAxis.store(on, std::memory_order_relaxed); }
+void SetKeepGamePose(bool on) { g_keepGamePose.store(on, std::memory_order_relaxed); }
+void SetCullScale(float s) { g_cullScale.store(s, std::memory_order_relaxed); }
+void SetCullFov(float degrees) { g_cullFov.store(degrees, std::memory_order_relaxed); }
+CamFields LastFields() { return g_fields; }
 bool IsEnabled() { return g_enabled.load(); }
 
 void SetCallbacks(ViewFn view, ProjFn proj) {
@@ -485,6 +550,21 @@ void SetCallbacks(ViewFn view, ProjFn proj) {
 void SetFrameCallback(FrameFn frame) { g_frameFn.store(frame); }
 void SetRayOverride(RayFn ray) { g_rayFn.store(ray); }
 void SetRayAdjust(RayAdjustFn fn) { g_rayAdjust.store(fn); }
+
+void SetCallerLog(bool on) { g_callerLog.store(on); }
+int CallerReport(char* out, size_t size) {
+	int n = 0;
+	out[0] = 0;
+	for (int kind = 0; kind < 2; ++kind) {
+		n += snprintf(out + n, size - n, kind ? " | RebuildView:" : "GetProjection:");
+		for (int i = 0; i < kCallerSlots && n > 0 && n < (int)size - 32; ++i) {
+			const uintptr_t rva = g_callerRva[kind][i].load(std::memory_order_relaxed);
+			const uint32_t c = g_callerN[kind][i].exchange(0, std::memory_order_relaxed);
+			if (rva && c) n += snprintf(out + n, size - n, " 0x%llX x%u", (unsigned long long)rva, c);
+		}
+	}
+	return n;
+}
 
 bool Refresh() {
 	void* cam = g_t.cam;

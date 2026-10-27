@@ -17,6 +17,9 @@
 #include <cstdio>
 #include <cstring>
 #include <intrin.h>
+#include <mutex>
+#include <string>
+#include <unordered_set>
 
 #include "sigscan.h"
 
@@ -40,6 +43,7 @@ LogFn g_log = nullptr;
 WantFn g_want = nullptr;
 std::atomic<int (*)(const char*, void*, void*, const void*)> g_watch{nullptr};
 std::atomic<bool> g_ready{false};
+std::atomic<bool> g_modelLog{false};
 std::atomic<unsigned> g_told{0};
 thread_local Context* t_current = nullptr;
 constexpr int32_t kOne = 1;   // where a redirected answer points: lives as long as the plugin
@@ -69,6 +73,23 @@ template <size_t N> bool String(const char* from, char (&out)[N]) {
         at += n;
     }
     return false;
+}
+
+// [debug] model_log: one line per distinct model + mesh + material, so a model with many materials is not told again and again.
+void LogBuild(const char* model, void* mesh, const char* material, int mapCount) {
+    static std::mutex lock;
+    static std::unordered_set<std::string> seen;
+    constexpr size_t kCap = 3000;
+    char modelName[256]{}, meshName[96]{}, materialName[96]{};
+    const char* meshNamePtr = nullptr;
+    if (!String(model, modelName)) return;
+    if (Read(&meshNamePtr, mesh, sizeof meshNamePtr)) String(meshNamePtr, meshName);   // GrannyMesh +0x00 is its name (PRZEKAZANIE.md)
+    String(material, materialName);
+    char line[512];
+    snprintf(line, sizeof line, "vrcam: model build - %s | mesh %s | material %s (%d maps)", modelName, meshName, materialName, mapCount);
+    std::lock_guard<std::mutex> guard(lock);
+    if (seen.size() >= kCap || !seen.insert(line).second) return;
+    g_log(line);
 }
 
 bool HookFind(const void* type, const void* object, const char* name, Member* out) {
@@ -138,6 +159,7 @@ void* HookBuild(const char* model, void* file, void* mesh, const Material* mater
     char rawPath[512]{}, rawName[128]{}, path[512]{}, name[128]{};
     std::string_view p, n;
     const bool haveMat = Read(&m, material, sizeof m);
+    if (g_modelLog.load(std::memory_order_relaxed) && g_log && haveMat) LogBuild(model, mesh, m.name, m.mapCount);
     if (holeAction == 3 && haveMat) {
         scope.type = m.type;
         scope.object = m.object;
@@ -175,6 +197,8 @@ void* HookBuild(const char* model, void* file, void* mesh, const Material* mater
 }  // namespace
 
 void WatchModels(int (*fn)(const char*, void*, void*, const void*)) { g_watch.store(fn, std::memory_order_release); }
+
+void LogModels(bool on) { g_modelLog.store(on, std::memory_order_relaxed); }
 
 void Install(LogFn log, WantFn want) {
     if (g_ready.load()) return;

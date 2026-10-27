@@ -49,6 +49,27 @@ bool IsEnabled();
 // is the old isometric aim, 45 degrees. Off on the next frame. [input] portal_axis.
 void SetEffectAxis(bool on);
 
+// Test: our matrices go into the camera, but its position and quaternion fields keep the game's own pose, so everything that reads
+// those fields (culling, the detail / grass window, rooms) sees the camera it always saw. Off on the next frame. [debug] keep_game_pose.
+void SetKeepGamePose(bool on);
+
+// Test: the camera's orthographic box (its AspectW/H fields, the old isometric view's size) made this many times larger after our frame sync,
+// for whatever reads it later in the frame (culling). 1 = the game's own. [debug] cull_scale.
+void SetCullScale(float scale);
+
+// Test: the camera's FovDeg field (the game's long lens, 3.44 degrees) replaced by this many degrees after our frame sync, put back at the next one.
+// 0 = the game's own. [debug] cull_fov.
+void SetCullFov(float degrees);
+
+// The game camera's own fields as of the last frame sync, for the log ([debug] cam_fields_log).
+struct CamFields { bool valid = false; uint32_t type = 0; float fov = 0, aw = 0, ah = 0, nearPlane = 0, farPlane = 0, vw = 0, vh = 0; };
+CamFields LastFields();
+
+// [debug] cam_callers_log: the game's codes asking GetProjection / RebuildView, counted by return address (RVA). CallerReport writes
+// "GetProjection: 0x.. xN ... | RebuildView: ..." and starts the counts over.
+void SetCallerLog(bool on);
+int  CallerReport(char* out, size_t size);
+
 void SetCallbacks(ViewFn view, ProjFn proj);
 
 // Called once per game frame, right after the game placed its camera and before

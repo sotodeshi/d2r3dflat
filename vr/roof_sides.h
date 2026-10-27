@@ -125,4 +125,8 @@ void Install(LogFn log, WantFn want);
 // empty model name.
 void WatchModels(int (*fn)(const char* model, void* file, void* mesh, const void* retAddr));
 
+// [debug] model_log: every distinct (model, mesh, material) the builder is asked for goes to the log, once, up to a cap -
+// to see what a ground texture that swims on raised ground is made of. Models already loaded are not built again.
+void LogModels(bool on);
+
 }  // namespace roofsides

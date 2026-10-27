@@ -333,3 +333,180 @@ zmieniać kodu. Jeśli gracz ma chcieć mniejszy pasek, a kliknięcia mają iś�
 to jest osobna zmiana: hitboxy nie jadą za `bar_size` / `bar_x` / `bar_y`.
 
 Nie ruszaj F3. Tam `BarSizeNow` celowo zwraca 1.
+
+---
+
+## Plamy i „pływające” tekstury na zmienionym poziomie (śledztwo od 2026-10-27, NIEROZWIĄZANE)
+
+Stan na koniec sesji 2026-10-27. Nic z tego nie jest w `CHANGES.md` (nie ma jeszcze zweryfikowanej
+poprawki), kod diagnostyczny leży w źródłach, **niezacommitowany**.
+
+### Objaw (gracz)
+
+Akt 2, Daleka Oaza, schody między półkami skalnymi, poziom poniżej 0, F2 i F3 (nie F1). Duża ciemna
+plama na płaskim terenie, o miękkich krawędziach, razem z teksturami typu spękane błoto i trawą.
+Przy ruchu myszą plama „pływa”: kursor w górę oddala ją, w dół przybliża, w lewo przesuwa w prawo.
+W jej obrębie widać **modele kamieni**, które „materializują się” po wejściu w plamę i znikają
+poza nią. **W F1 tych kamieni nie ma wcale.** Poza plamą kamienie są niewidoczne (jasny kamień na
+jasnym piasku, bez cienia). Na poziomie 0 gracz widział to krótko albo wcale.
+
+### Pewne ustalenia (zmierzone)
+
+- Plama NIE jest w albedo G-buffera; jest już w pierwszej kopii celu koloru po przebiegu G-buffera
+  (linia 101 śladu), czyli powstaje wewnątrz shaderów materiałów (shader terenu liczy oświetlenie
+  i cienie sam, w pętli po listach dekali/świateł kafelka).
+- W klatkach zatrzymanych (dwa zrzuty, różny pitch) plamy NIE przesuwają się względem świata:
+  korelacja map z góry dała 0,00 jednostek przy każdej wysokości płaszczyzny −26…−17
+  (`groundshift.ps1`). Zjawisko jest dynamiczne albo zależy od czegoś poza jedną klatką.
+- Macierze świata (b0) tych samych obiektów są IDENTYCZNE w dwóch widokach. Macierze kamery w
+  przejściu G-buffera są spójne (view, invView, viewProj). Macierz widok→mapa cieni (`cb10[14..17]`)
+  jest spójna z naszym widokiem (bohater trafia w UV 0,50/0,50). Obie kaskady cieni pokrywają
+  95–97% widocznej ziemi, w tym całą plamę.
+- Teren płaski jest rysowany przez PS `a11d8d1c6efd3f33` (VS `1a9cba7642393f45`, bez UV, liczy
+  `uv = (POS_WS.xz − POS_WS.y·1,224745 − cb10[3].zw)/180`, próbkuje `t35` kolor, `t36` normalne).
+  Kolor terenu składa co klatkę **compute `775c45982728780a`** (2019 linii, tablice `t10–t13`,
+  `t30–t34`, UAV `u4–u7`, grupy 8×8, stałe `cb4`, `cb7`): jego pominięcie daje czarną podłogę.
+  Modele: PS `ae12b1e437155234` i pokrewne (pominięcie czerni modele). Trawa i rekwizyty:
+  PS `df7d377bda243447` z VS `e93f2ed14b51e9e0` (wiatr, bez zależności od kamery).
+- Pola kamery gry w świecie (log `[debug] cam_fields_log`): `type 0`, `FovDeg 3,44`, aspect
+  2560×1440, near 10, far 10000 (długa ogniskowa imitująca ortografię; w menu bywa `type 1`,
+  pudełko 94,28×53,03). `FovDeg` steruje projekcją własnej kamery gry w F1.
+- **Obserwacje gracza (2026-10-27, druga sesja):** po obrocie i zatrzymaniu plama wraca dokładnie pod to
+  samo ciało; patrząc w dół i w górę (po 2 s) zawsze w tym samym miejscu ziemi; przy chodzeniu bez myszy
+  się nie rusza. „Płynie” tylko w trakcie obrotu. Limit 30 FPS nie zmienia, jak daleko odjeżdża (to nie
+  jest opóźnienie o klatkę).
+- Shader terenu `a11d8d1c…` ma pętlę **dekali w kafelkach ekranu**: kafelek z `(v0.xy − cb3[2].xy)·cb3[1].zw·cb10[13].zw`,
+  liczba z `t4`, lista z `t5` (stride 1024), dane dekala (3 wiersze macierzy pudełka, flagi, warstwy) z bufora `t8`,
+  tekstury dekali `t31` (normalne), `t32` (kolor/maski); test `|p|≤0,5` w pudełku. Macierz pudełka działa na `v2`,
+  a `v2` to **pozycja w przestrzeni widoku** (VS `1a9cba76…`: `o2 = świat × cb3[5..8]`). Dekale dostają więc z CPU
+  pudełka już przeliczone do widoku kamery. Plama/spękane błoto to najpewniej te dekale.
+- `t44` to maska w przestrzeni ekranu (`v0.xy·cb3[0].zw`) mnożąca światło i ambient w terenie i trawie.
+- Kolejność w klatce (`[debug] frame_order_log`): na jednym wątku gra dwa razy woła `BuildFrame` (`B`), dopiero
+  potem nasza synchronizacja kamery (`S`), co ~18 ms: `B@0 B@3,9 S@5,7 B@18,1 …`. `MouseTick` chodzi na innym
+  wątku co 1–2 ms.
+- Przejście oświetlenia w ogólnym sensie: 17 shaderów compute, żaden nie próbkuje map cieni.
+  `5fafbd06ef7f97d7` (2100 linii, 48× `sample_c`) to włosy/skóra, nie teren.
+
+### Wykluczone (każde sprawdzone w grze lub na danych)
+
+Modele `global/grunge/*`; pełnoekranowe przejścia piszące do albedo (`d92d77ce`, `0f833afc`,
+`4c551117`, `53183967`, `bc28182c`, `f56bdb8a`, `35348faf`; `f0102f21` i `403f6d66` to światło,
+ekran robi się czarny); AO, jakość cieni, blended shadows, tryb wygładzania; okno `cb10[47].zw`
+(przypięte, log potwierdza); warstwy `cb10[69..89]` (wyzerowane, log potwierdza); tryb filtrowania
+cieni `cb10[31/33].w` (wyzerowany, log potwierdza); zakres liniowej głębi (`depth_fix_mode 2`,
+działa po naprawie, bez wpływu); pola `Pos/Quat` kamery (`keep_game_pose`); `[fog]` i `[sky]`
+(efekt ReShade); `rings` 2→4; pola `AspectW/H` (`cull_scale`); pole `FovDeg` (`cull_fov`, w F2/F3
+bez zmian, w F1 psuło widok, bo nie było ograniczone do naszej kamery: poprawione i wdrożone
+2026-10-27 16:43). Druga sesja: `skip_shaders=5d76441e00c5b627` (cały obraz czarny, także menu:
+to złożenie obrazu, nie maska), `skip_shaders=a914164017855558` (maska R8 2560×1440, bez zmian);
+`[debug] early_view=1` (nasz widok przeliczony jeszcze raz przed każdym `BuildFrame`): plamy bez
+zmian, za to cienie obiektów drżą przy obrocie, więc dekale nie biorą kamery w `BuildFrame`;
+opóźnienie o klatkę (limit 30 FPS bez różnicy); postproces (zrzut przebiegów w trakcie obrotu:
+plama identyczna po przejściu terenu i w obrazie końcowym); listy dekali/świateł w kafelkach
+(`[debug] one_tile`, siatka 32×20 → 1×1, plama bez zmian); okna map (`[debug] window_log`, log każdej
+zmiany: okno mapy terenu `b10[3].zw` skacze o pełne 180 jednostek, okno nakładki `b10[47].zw` = oko − 90
+co 10 jednostek, obie treści przypięte do świata, płynnego ruchu nie tłumaczą). Nasza kamera nie ma
+wygładzania obrotu (`VrView` bierze `TargetYaw/TargetPitch` wprost).
+Gracz: plama idzie do przodu przy myszy w górę, w prawo przy myszy w lewo, niezależnie od kierunku
+patrzenia (względem kamery). Uwaga: w poziomie „wyprzedza” obraz, w pionie „zostaje w tyle” — możliwy
+odwrócony znak osi X w czymś, co przelicza ruch kamery.
+Maska ekranowa `t44` = `1280×720 R16_FLOAT`, rysuje ją pełnoekranowy PS `3270b93ced3e18bd`;
+`skip_shaders=3270b93ced3e18bd`: plama bez zmian (odpada). Nowe narzędzie `[debug] ui_trace_srv`
+(z `ui_trace=1`): ślad wypisuje tekstury shadera terenu/trawy po rejestrach (`srv ps …: t35=#… …`)
+i zrzuca 8-bitowe mapy ≥2048 (t35 kolor, t36 normalne terenu, 3888×3888) jako `uitex_*_28.raw`.
+W śladzie (diag_srv_2026-10-27): t35/t36 3888×3888 RGBA8 UAV, t39 kaskady cieni, t40 512² fmt53,
+t42 2560×1440 R8, t44 jw., t45–t48 32×8 RGBA16F.
+**PRZEŁOM (2026-10-27 wieczór): plama JEST w mapie koloru terenu t35**, już przed oświetleniem
+(zrzuty `diag_map_2026-10-27\{f1,f2,f2_down,f2_up}`, postać w miejscu, różne kamery). Ciemne plamy
+błota to warstwa materiału składana przez compute `775c4598…`; mapa jest toroidalna (widoczne szwy
+pasów w tym samym miejscu we wszystkich zrzutach). Porównanie masek plam
+(`scripts\mapcompare.ps1`): trzy mapy z F2 mają ten sam wzór, przesunięty zależnie od kamery,
+przesunięcia się sumują (f2→dół 9,6/5,9; dół→góra 1,9/17,8; f2→góra 11,5/23,7 jednostek x/z);
+F1 względem F2 ~30–60 jednostek. Oko (b10[1]): F1 9619/419/10628, F2 9070/−5,8/10072,
+dół 9082/4,5/10091, góra 9078/−11,1/10079 — przesunięcie nie jest prostą funkcją oka.
+Wniosek: CPU podaje compute'owi położenie warstw (`cb7[5..8]` macierze pudełek, `cb7[0]` okno,
+`cb4`) zależne od kamery.
+**Potwierdzone na stałych (diag_map_2026-10-27\mv1, mv2; `scripts\tilelayers.ps1`):** compute 775c
+działa tylko gdy kamera się rusza; jeden dispatch = jeden kafel 10×10 jednostek (216² tekseli,
+`cb7[0].xy` = numer kafla jako int, `cb7[24].y` = 216), w nim do 3 warstw: wiersze z intami
+i parametrami, potem macierz świat→warstwa (wiersz x, (0,1,0,0), wiersz z, translacja z w=1).
+Te same warstwy (ta sama skala 0,0509 i 0,0150) mają w mv2 środek przesunięty o (−3,3; −6,5)
+względem mv1 — CPU przesuwa warstwy materiału razem z kamerą. Oko mv1 9071,98/−3,86/10074,5,
+fwd 0,243/−0,477/0,845; mv2 9072,23/−0,63/10076,8, fwd 0,228/−0,667/0,709 — wzoru nie znaleziono.
+`[debug] cam_callers_log`: GetProjection wołane z 7 miejsc (0xEDE410, 0xEDE9FA, 0xE3977A, 0xF74D20,
+0xE08778, 0xE039E7, 0x6AAEBF) tyle samo w spoczynku i w ruchu; RebuildView wcale — kod warstw
+nie idzie przez te funkcje.
+
+### WZÓR (2026-10-27, `[debug] layer_log`, `scripts\layerfit.ps1`, `diag_map_2026-10-27\layer_log_1.log`)
+
+556 chwil w F2 dopasowanych do położeń z F1 (głosowanie par o tej samej skali):
+**przesunięcie warstwy = h · (k − 4 · fwd.y · fwd.xz)** (osobno x i z), gdzie k = 1,224745,
+fwd = kierunek patrzenia naszej kamery (b10[2]), **h = wysokość terenu pod postacią** (LookAt.y
+= −22,97; L.y·k = −28,13 = wyraz wolny dopasowania −28,02). Oś z: −28,02 + 92,48·fy·fz, rms 1,0;
+oś x: −26,9 + 79,9·fy·fx (kilka błędnych par). Dla kamery gry fwd = (−0,612, −0,5, −0,612):
+−4·fy·fxz = k → przesunięcie 0. Gra liczy ścięcie warstw materiału z KIERUNKU KAMERY (zakłada
+izometrię), a geometria terenu ma k na sztywno w shaderze (1,224745) — z naszą kamerą się
+rozjeżdżają; na poziomie 0 (h = 0) problemu nie ma.
+Gra bierze kierunek raczej z macierzy (View/InvView), nie z Quat (`keep_game_pose` nie pomógł).
+Drogi naprawy: (1) znaleźć kod czytający kierunek (sprzętowy breakpoint na InvView/View w kamerze)
+i dać mu kierunek gry; (2) poprawiać translacje warstw w b7 compute'a 775c przed GPU
+(push_descriptors, jak depth_fix dla b10) o −h·(k − 4·fy·fxz) — wymaga h warstwy (h postaci
+działa tylko dla warstw na poziomie postaci).
+
+### NAPRAWA (2) DZIAŁA — test 2026-10-27 18:29
+
+`[debug] layer_fix=1` (z `ui_trace=1`, `vr/uitrace.cpp` `LayerFix`): przy dispatchu 775c fwd z b10
+row 2 tego dispatchu, h = LookAt.y (`VrFrame` → `uitrace::SetLayerFixHeight`), każda warstwa w b7
+przesunięta (tu += a·ox + b·oz, tv += c·ox + d·oz), zakres już poprawiony rozpoznany po hashu treści.
+Gracz: „sukces, plamy zniknęły” (przestały pływać). Log (`diag_map_2026-10-27\layer_log_fix.log`):
+po poprawce warstwy w F2/F3 leżą tam, gdzie w F1, z dokładnością ~0,06 jednostki (wcześniej 30–60).
+Krótkie przycięcie po włączeniu — najpewniej zalew `layer_log` (6000 linii w kilka sekund) i `ui_trace`.
+**Wersja docelowa (18:38, zweryfikowana w grze, opisana w `CHANGES.md` sekcja 9):**
+`[render] ground_layer_fix=1` (domyślnie 1), bez `ui_trace` — w haku camfix
+`SetComputeRootConstantBufferView` (`camfix::GroundLayers` → `groundfix::Bound/Fix`), rejestr przez
+`uitrace::CbRegister`; testowy `[debug] layer_fix` usunięty. Zostaje do zrobienia: h warstwy zamiast
+h postaci (warstwy na innym poziomie niż postać) — np. sprzętowy breakpoint na kierunku kamery.
+
+### Najbliższe tropy (nieprzetestowane)
+
+1. Lista warstw/dekali dla compute `775c4598…` jest przygotowywana przez CPU. Sprawdzić skąd
+   `cb7[0]` (okno), `cb7[2..8]` (warstwa, macierz) i `cb4` i czym jest przycinana lista.
+2. Kamienie istnieją tylko przy naszej kamerze: system detali przy ziemi (zasięg od kamery)? Szukać
+   funkcji gry, która go włącza i czy czyta wysokość/pozycję kamery.
+3. Zapis tego samego celu po każdym przejściu już działa (`ui_trace_passes`); można go użyć dla
+   klatki w ruchu (Ctrl+F10 podczas obrotu): rozstrzyga, czy plama jest przesunięta już po G-bufferze
+   (dane dekali), czy dopiero w postprocesie (historia czasowa: TAA/skalowanie z wektorami ruchu
+   liczonymi z kamery gry). Nie wiadomo, czy wcześniejszy test „trybu wygładzania” objął DLSS/FSR.
+4. Gdzie CPU przelicza pudełka dekali do widoku (bufor `t8`) i z jakiej macierzy/kiedy.
+
+### Narzędzia dodane (wszystkie klucze `[debug]`, domyślnie wyłączone)
+
+`ui_trace` (Ctrl+F10, już było), `ui_trace_geometry` (opis rysowań geometrii), `ui_trace_passes`
+(kopia kolorów sceny po każdym przejściu), `dump_shaders` (lista hashy), `dump_compute` (wszystkie
+compute), `model_log`, `pin_decal_window`, `kill_decal_layers`, `no_sun_shadow`, `keep_game_pose`,
+`cull_scale`, `cull_fov`, `cam_fields_log`; `[render] skip_shaders` obsługuje teraz też hash
+compute (pomija dispatch). Szczegóły i znaczenie: `INI_ADDED.md`, sekcja „Diagnostic keys”.
+Rozbieranie shaderów: `fxc -dumpbin plik.dxbc` (w Git Bash z `-`, nie `/`), Windows SDK
+`...\10.0.26100.0\x64\fxc.exe`. Python nie jest zainstalowany; skrypty PowerShell/C# w
+`E:\AndroidStudioProjects\d2vrflat_backup\diag_2026-10-27\scripts` (`uitex2png.ps1`,
+`groundshift.ps1`, `shadowcheck.ps1`, `cascademap.ps1`).
+
+### Naprawione przy okazji (do opisania w `CHANGES.md` dopiero po weryfikacji)
+
+`depthsrc::Configure` (haczyk konstruktora ramki, `[render] depth_fix_mode 2`) był wołany tylko
+raz przy starcie z `LoadSettings`, gdy kod gry jest jeszcze zaszyfrowany; pierwsza nieudana
+kontrola sygnatur kończyła się po cichu i na stałe. Teraz `depthsrc::Tick` ponawia instalację
+(do ok. 40 s). Efekt widoczny w logu, ale poprawy obrazu nie potwierdzono. Dodatkowo w ini gracza
+`depth_fix_mode=1` jest martwy („0 root signatures bind b10”): tryb 1 nie znajduje bufora b10.
+
+### Dane i stan ini
+
+- Diagnostyki (ok. 2 GB) są w `E:\AndroidStudioProjects\d2vrflat_backup\diag_*`
+  (zrzuty celów `uitex_*.raw`, kopie po przejściach `uipass_*.raw`, ślady `*.txt`, shadery
+  `shader_*.dxbc`, `compute_*.dxbc`, katalogi `geo2_*`).
+- Żywy `d2r_vr.ini` jest wrócony do wartości gracza (`rings=2`, `depth_fix_mode=1`, `ui_trace=0`,
+  testowe klucze `[debug]` na 0); aktualnie ustawione `cam_fields_log=1`, `cull_scale=1`,
+  `cull_fov=0`. Wdrożona DLL to wersja z 16:31 (z błędem `cull_fov` w F1, ustawione na 0 = bezpieczne).
+- Źródła zmienione, niezacommitowane: `cleanroom/camera/d2rcam.{cpp,h}`, `vr/uitrace.cpp`,
+  `vr/vrcam.cpp`, `vr/roof_sides.{cpp,h}`. `CHANGES.md` i `INI_ADDED.md` miały zmiany jeszcze
+  przed tym śledztwem (nie moje).

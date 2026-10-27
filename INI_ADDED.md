@@ -12,9 +12,10 @@ for `[mode] platform=0` (monitor). Live file: `d2r_vr.ini` (copy under
 | `[input]` | `flat_body_pick_third` | `1` | Same aim in F2. |
 | `[input]` | `portal_face` | `1` | F2/F3: hide portal black centre mesh (`0` game / `1` collapse / `2` empty name). Not F1. |
 | `[input]` | `portal_axis` | `0` | Test only: effects born from fixed 45° camera quat. Leave `0` (did nothing useful 2026-10-19). |
-| `[input]` | `npc_look_horizon` | `1` | F3: on NPC dialogue, set look pitch from nearest MonStats height (+6°). |
+| `[input]` | `npc_look_horizon` | `1` | F3: on NPC dialogue, set the look pitch so the NPC's face sits at `npc_face_y` of the screen. |
 | `[input]` | `npc_face_y` | `0.30` | With `npc_look_horizon`: where the NPC's face is put on the screen when the dialogue opens (fraction of screen height from the top). Pitch is solved from MonStats height, distance and the real FOV; the NPC is the unit under the pointer at the click, nearest only as a fallback. |
 | `[input]` | `flat_iso_ray` | `1` | Confirmed 2026-10-26: game's ground test gets the isometric ray `-(k,1,k)` through the body's feet / the crosshair's floor point (elevation fix, stage 1). Needs `flat_body_pick(_third)`. |
+| `[render]` | `ground_layer_fix` | `1` | F2/F3 (any view with our camera): the ground's material layers (mud, cracks, bumpy stones) on raised / lowered ground stay where the game's own camera puts them instead of sliding while the camera turns. Live. Needs `[debug] replay_proto=1` (default: its root CBV hooks). See `CHANGES.md` section 9. |
 | `[debug]` | `flat_elev` | `0` | Log every 2 s: look-at vs hero path place (grid or render frame?), ray callers (RVAs), adjust counters, projected capsules; plus the game's own hover (read without clicking) against the grid point of the last ray, on every change. Read only. |
 
 ## Value changes (key already existed upstream)
@@ -92,3 +93,38 @@ path grid match. Pads with a **different** floor than the hero still need per-un
 **v15 tried absolute shear in `flat_pick` — wrong:** camera LookAt and path Place are
 already the same frame (unlike F4 skeleton pose). Capsules missed; no hover/labels.
 **v16:** reverted. Relative `dY * k` only when we have a real per-unit floor delta.
+
+## Diagnostic keys (investigation tools, all off by default)
+
+Added while chasing the ground patches that slide with the mouse look on lowered ground in F2/F3
+(see `PRZEKAZANIE.md`). None of them changes anything in a normal game; they are read live unless
+noted, and the files they write go beside the ini (move them out of `plugins` afterwards).
+
+| Section | Key | Role |
+|---------|-----|------|
+| `[debug]` | `ui_trace` | Ctrl+F10 records one frame of the game's GPU work (read at start; costs every frame). Already upstream. |
+| `[debug]` | `ui_trace_geometry` | The trace also describes mesh draws: shader hashes, depth/blend state, root constants. |
+| `[debug]` | `ui_trace_passes` | Colour target (R11G11B10) copied after every pass that drew into it (`uipass_<line>_<target>_..raw`, up to 96 per frame). |
+| `[debug]` | `dump_shaders` | Space-separated hashes (as the trace prints `vs`/`ps`): their DXBC written as `shader_<hash>.dxbc` when the game makes the pipeline (needs a game start). |
+| `[debug]` | `dump_compute` | Every compute shader written as `compute_<hash>.dxbc` (needs a game start). |
+| `[debug]` | `model_log` | Every distinct model/mesh/material the material builder is asked for goes to the log. |
+| `[debug]` | `pin_decal_window` | Frame constants b10[47].zw pinned to a window centred on the eye (BuildFrame hook, `depth_fix` machinery). |
+| `[debug]` | `kill_decal_layers` | Frame constants b10 rows 69..89 `.x .y .w` zeroed each frame. |
+| `[debug]` | `no_sun_shadow` | b10[31].w and b10[33].w (shadow filter mode) zeroed each frame. |
+| `[debug]` | `keep_game_pose` | Our matrices go into the camera but its position/quaternion fields keep the game's pose. |
+| `[debug]` | `cull_scale` | The camera's `AspectW/H` fields scaled by this (1 = off), only while our camera is active. |
+| `[debug]` | `cull_fov` | The camera's `FovDeg` field replaced by this many degrees (0 = off), only while our camera is active. |
+| `[debug]` | `cam_fields_log` | The game camera's own fields (type, fov, aspect, near, far, viewport) in the log every 3 s. |
+| `[debug]` | `frame_order_log` | 48 events logged once (re-armed by switching it 0 → 1): our frame sync `S`, the game's frame builder `B` (`+` = refreshed by `early_view`), `MouseTick` `M`, with thread and time. Hooks the frame builder. |
+| `[debug]` | `early_view` | Test: our view worked out again (newest mouse look) just before each frame build. Did not move the ground decals; object shadows shake while turning. Hooks the frame builder. |
+| `[debug]` | `one_tile` | Frame constants b10[13].zw (the screen tile grid of the decal / light lists, 32 × 20) made 1 × 1. |
+| `[debug]` | `window_log` | b10 rows 1, 3, 47 (eye, terrain map window, overlay window) logged every 2 s and at every change of a window. |
+| `[debug]` | `pin_terrain_window` | b10[3].zw (the terrain colour map's window) pinned to the window centred on the eye. |
+| `[debug]` | `cam_callers_log` | The game's codes calling the camera's GetProjection / RebuildView, counted by return address (RVA), every 2 s. |
+| `[debug]` | `ui_trace_srv` | With `ui_trace`: the trace lists the textures of watched pixel shaders by register (`1` = terrain `a11d8d1c…`, grass/props `df7d377b…`, plus the ground map compute `775c4598…`'s constants at each dispatch; or hex hashes), and copies the 8-bit ground maps (t35/t36). Follows every descriptor write while on (read at start). |
+| `[debug]` | `layer_log` | With `ui_trace`: every move of a ground material layer (its world centre from the compute's b7) logged with the eye and view direction of the same dispatch (up to 6000 lines; re-armed by 0 → 1). |
+| `[render]` | `skip_shaders` | Existing key; now also takes a compute shader's hash: its dispatches are left out (the pixel-shader hashes still skip draws). |
+
+The BuildFrame-hook tests (`pin_decal_window`, `kill_decal_layers`, `no_sun_shadow`) need the frame builder
+hook, which now installs on a retry from the update tick (it was asked once at start, while the game's code
+was still encrypted, and gave up for good).
