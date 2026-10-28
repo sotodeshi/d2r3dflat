@@ -10,6 +10,9 @@ for `[mode] platform=0` (monitor). Live file: `d2r_vr.ini` (copy under
 |---------|-----|--------------|------|
 | `[input]` | `flat_body_pick` | `1` | F3: cursor on body/object capsule selects that unit (ray aimed at feet). |
 | `[input]` | `flat_body_pick_third` | `1` | Same aim in F2. |
+| `[input]` | `portal_auto` | `0` | F2/F3 (mouse look + W A S D): walking into a portal enters it (a real click once the game's hover reports the portal). Both ways; not re-entered until you walk away from it after a new area. |
+| `[input]` | `portal_auto_radius` | `4.0` | With `portal_auto`: how near the portal (world units, 2 per cell) the hero must be. |
+| `[input]` | `portal_auto_delay_ms` | `150` | With `portal_auto`: how long he stays that near, walking, before it is entered. |
 | `[input]` | `portal_face` | `1` | F2/F3: hide portal black centre mesh (`0` game / `1` collapse / `2` empty name). Not F1. |
 | `[input]` | `portal_axis` | `0` | Test only: effects born from fixed 45° camera quat. Leave `0` (did nothing useful 2026-10-19). |
 | `[input]` | `npc_look_horizon` | `1` | F3: on NPC dialogue, set the look pitch so the NPC's face sits at `npc_face_y` of the screen. |

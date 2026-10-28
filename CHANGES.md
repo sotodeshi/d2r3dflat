@@ -410,3 +410,30 @@ Things that were learnt on the way:
 
 Files: `vr/map_arrow.h` (pure maths: way, rows, mark; checked by `tools/map_arrow_test.cpp`), `vr/hud.cpp`
 (`DrawMapArrow`, `SetMapArrow`), `vr/vrcam.cpp` (ini key, heading, per-frame call), `d2r_vr.ini`.
+
+## 12. Walking into a portal enters it (flat F2 / F3, 2026-10-28)
+
+`[input] portal_auto=1` (default 0) makes a portal take the hero when he walks into it, with W A S D. Both ways (field to
+town and town to field): every portal object is treated the same. It runs only with `[mode] platform=0`, in third person
+(F2) and first person (F3) with the mouse look; F1, F4 and VR are not touched.
+
+It does not call the game's interaction code and does not invent a click on a guessed spot. The game's own click path does
+the work, so the server gets the packet the game would send for a click:
+1. Every frame the nearest portal object (kind 4 of `flat_pick_obj.inc`: classes 59, 60, 100, 298, 342, 377) is found on
+   the grid (the grid has no height, so raised ground does not matter). With a move key held and the hero within
+   `portal_auto_radius` (world units, default 4 = two cells) for `portal_auto_delay_ms` (default 150), the crosshair's ray
+   (`HookScreenToRay` -> `flatpick::Adjust`) is aimed through the portal's feet, the same way it is for a body.
+2. The game's hover (`HoverUnit` of the local player, read on the mouse code's thread) must report a type-2 unit of a
+   portal class. Only then the left button goes down (`SendInput`); 60 ms later it comes up. If the hover does not pick the
+   portal within 700 ms nothing is clicked. A button that went down always comes up (also if the mode is left in between).
+3. While the ray is forced, `flat_click_shoot` does not turn the click into a shot at the crosshair.
+
+Safeguards:
+- No bouncing: the hero appears next to the portal he came through. After a new area (the game's `SetCurrentBiome`) or a
+  jump of his place by more than 30 units, nothing is entered until the new area has settled (1.5 s) and the hero has
+  walked `portal_auto_radius + 1.5` away from every portal. After a click the same applies.
+- Clean start in the new area: the game's keyboard-move bytes (`0x2A23754`) are cleared once when a new area is set
+  (`HookKeyMove`); a key still held sets them again. The click is the game's own, a full press and release.
+
+Files: `vr/flat_pick.cpp` (`PortalAuto`, `Adjust`), `vr/flat_pick.h`, `vr/vrcam.cpp` (ini keys, `PortalClick`, `VrFrame`
+call, `HookKeyMove`, `HookSetBiome`), `d2r_vr.ini`.

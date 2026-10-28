@@ -413,6 +413,9 @@ struct Settings {
     std::atomic<bool>  flatClickShoot{true}; // [input] flat_click_shoot: flat mouse look, a click with no target under the crosshair = a shot there, never a walk
     std::atomic<bool>  flatBodyPick{true};   // [input] flat_body_pick: flat first person, a cursor on a body picks that unit's feet
     std::atomic<bool>  flatBodyPickThird{true};   // [input] flat_body_pick_third: the same aim in flat third person
+    std::atomic<bool>  portalAuto{false};     // [input] portal_auto: flat F2/F3, walking into a portal enters it (vr/flat_pick.h PortalAuto)
+    std::atomic<float> portalAutoRadius{4.0f}; // [input] portal_auto_radius: how near the portal (game world units, 2 per cell) the hero must be
+    std::atomic<int>   portalAutoDelay{150};   // [input] portal_auto_delay_ms: how long he stays that near, walking, before it is entered
     std::atomic<int>   portalFace{1};   // [input] portal_face: the portal's black centre (vr/portal_hole.h), F2/F3 only: 0 the game's, 1 not built, 2 built under an empty name
     std::atomic<bool>  npcLookHorizon{true};  // [input] npc_look_horizon: flat F3, aim look from MonStats height when an NPC's dialogue opens
     std::atomic<float> npcFaceY{0.30f};       // [input] npc_face_y: where the NPC's face is put on the screen then (0 top .. 1 bottom)
@@ -679,6 +682,7 @@ bool IniB(const wchar_t* sec, const wchar_t* key, bool def) { return IniF(sec, k
 SRWLOCK g_biomeLock = SRWLOCK_INIT;
 std::vector<std::string> g_outdoor;
 char g_biome[96] = "";                  // last name the game set, bare (no folder, no extension), lower case
+std::atomic<uint32_t> g_areaGen{0};     // bumped by the game's SetCurrentBiome only (an area loads): [input] portal_auto
 std::atomic<uint32_t> g_biomeGen{0};    // bumped by every SetCurrentBiome
 
 void LoadOutdoorBiomes() {
@@ -2061,6 +2065,9 @@ void LoadSettings() {
     g_set.flatCrosshair.store(IniB(L"input", L"flat_crosshair", true));
     g_set.flatBodyPick.store(IniB(L"input", L"flat_body_pick", true));
     g_set.flatBodyPickThird.store(IniB(L"input", L"flat_body_pick_third", true));
+    g_set.portalAuto.store(IniB(L"input", L"portal_auto", false));
+    g_set.portalAutoRadius.store(std::clamp(IniF(L"input", L"portal_auto_radius", 4.0f), 1.0f, 10.0f));
+    g_set.portalAutoDelay.store(std::clamp((int)IniF(L"input", L"portal_auto_delay_ms", 150.0f), 0, 2000));
     g_set.portalFace.store(std::clamp((int)IniF(L"input", L"portal_face", 1.0f), 0, 2));
     g_set.npcLookHorizon.store(IniB(L"input", L"npc_look_horizon", true));
     g_set.npcFaceY.store(std::clamp(IniF(L"input", L"npc_face_y", 0.30f), 0.05f, 0.60f));
@@ -3350,6 +3357,9 @@ V3 Facing(float heading, float down) {
 }
 
 namespace prevscan { void FrameDone(); }
+bool ShooterActive();
+bool KeyMoveMode();
+bool ChatOpen();
 void VrFrame() {
     frameorder::Note('S');
     prevscan::FrameDone();
@@ -3363,6 +3373,13 @@ void VrFrame() {
                           && ((view == 3 && g_set.flatBodyPick.load()) || (view == 2 && g_set.flatBodyPickThird.load()));
     const bool body = bodyPick && !gamestate::MenuOpen() && haveLook;
     flatpick::Refresh(body, look[0], look[1], look[2]);
+    {   // [input] portal_auto: flat F2 / F3 with the mouse look and W A S D; a move key held is the walk into the portal
+        const bool wanted = g_set.portalAuto.load() && g_set.platform.load() == 0 && g_enabled.load() && (view == 2 || view == 3) && haveLook &&
+                            !gamestate::MenuOpen() && ShooterActive() && KeyMoveMode();
+        auto held = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+        const bool moving = wanted && GameFocused() && !ChatOpen() && (held('W') || held('A') || held('S') || held('D'));
+        flatpick::PortalAuto(wanted, moving, g_areaGen.load(), look[0], look[1], look[2], g_set.portalAutoRadius.load(), g_set.portalAutoDelay.load());
+    }
     // Flat F3: when an NPC's dialogue opens, aim the mouse look from MonStats height so the
     // options sit above that NPC's head (short vs tall), not on their face.
     // Read-only unit walk only - do not call HoverUnit/ClientIndex from this thread (crashes on F3).
@@ -4726,6 +4743,13 @@ void SendLeftButton(bool down) {
     in.type = INPUT_MOUSE;
     in.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
     SendInput(1, &in, sizeof in);
+}
+// [input] portal_auto's click (flat mouse look: the pointer sits in the window's middle, where the crosshair is). The press needs the game's window in front;
+// the release is sent whatever the focus is, so a button never stays down.
+bool PortalClick(bool down) {
+    if (down && !GameFocused()) return false;
+    SendLeftButton(down);
+    return true;
 }
 // The press in two steps a frame apart, so Shift is already down when the
 // click is read: 0 idle, 1 Shift down, 2 Shift and button down.
@@ -6191,6 +6215,7 @@ const uint8_t kSigKeyMove[17] = {0x48,0x83,0xEC,0x48,0x0F,0x29,0x74,0x24,0x30,0x
 using KeyMoveFn = uint64_t (*)();
 KeyMoveFn OrigKeyMove;
 std::atomic<int> g_keyMove{0};               // the hook: 0 not in yet, 1 in, 2 not possible (another build) - the old pad way then
+std::atomic<bool> g_keysReset{false};         // [input] portal_auto: a new area was set, HookKeyMove clears the move bytes once
 std::atomic<uint32_t> g_keyMoveCalls{0};     // how often the game asked: still while W is held = its UI is on the pad
 
 // Flat play through the keyboard move: on while the hook is in or may still go in.
@@ -6294,6 +6319,10 @@ bool FlatMoveInput(float* px, float* py, const char** from) {
 // vector goes back instead. With no input the original runs untouched.
 uint64_t HookKeyMove() {
     g_keyMoveCalls.fetch_add(1, std::memory_order_relaxed);
+    // [input] portal_auto: a new area starts from the game's keyboard-move bytes cleared; a key still held sets them again below
+    if (g_keysReset.exchange(false)) {
+        if (volatile uint8_t* k = (volatile uint8_t*)d2rsig::Addr(RVA_MOVE_KEYS)) k[0] = k[1] = k[2] = k[3] = 0;
+    }
     // A move key let go while another window was in front (the settings window, its
     // sliders) never reached the game: its Move byte stayed set and the hero walked on
     // by himself (2026-10-07). With the game not in front its move bytes are cleared;
@@ -6464,7 +6493,7 @@ uint64_t HookMapClick(void* unit, int type, int x, int y, uint64_t flags) {
         }
     }
     if (unit && mouseType && !(flags & 0xFF)) {
-        const bool shooter = g_set.flatClickShoot.load() && KeyMoveMode() && ShooterActive();
+        const bool shooter = g_set.flatClickShoot.load() && KeyMoveMode() && ShooterActive() && !flatpick::PortalForcing();   // (a portal's click is no shot)
         // VR first person ([gameplay] attack_in_place): a click on bare ground - from a mouse, the laser or a program - is a skill in
         // place, never a walk (vr/stand_still.h); on a monster, an item, a door or an NPC it stays the game's own click
         const bool still = standstill::ClickCandidate(standstill::Wanted(), viewgate::F4(), gamestate::MenuOpen(), true, type, flags);
@@ -7647,6 +7676,8 @@ uintptr_t HookSetBiome(const char* name) {
     for (size_t i = 0; b[i] && b[i] != '.' && i + 1 < sizeof bare; ++i) bare[i] = (char)tolower((unsigned char)b[i]);
     AcquireSRWLockExclusive(&g_biomeLock); memcpy(g_biome, bare, sizeof bare); ReleaseSRWLockExclusive(&g_biomeLock);
     g_biomeGen.fetch_add(1);
+    g_areaGen.fetch_add(1);
+    if (g_set.portalAuto.load()) g_keysReset.store(true);
     replay::AreaChanged();   // the replay pauses for the new area, its last pair finished on the GPU first
     return OrigSetBiome(name);
 }
@@ -17977,6 +18008,7 @@ D2RL_PLUGIN_EXPORT bool D2RLoaderLoadPlugin(const PluginContext* ctx) noexcept {
     d2rcam::SetRayOverride(&VrRay);
     flatpick::SetLog(&Log);
     flatpick::SetHoverProbe(&FlatHoverProbe);
+    flatpick::SetPortalClick(&PortalClick);
     d2rcam::SetRayAdjust(&flatpick::Adjust);
     MH_Initialize();   // XInput only; game code is hooked through the loader
     skel::SetGameBase(g_base);

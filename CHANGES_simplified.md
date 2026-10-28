@@ -65,6 +65,13 @@ while the camera turned (looking up moved them away, looking down moved them clo
 which is only right for its isometric camera. The layers are corrected before the GPU reads them.
 Key: `[render] ground_layer_fix`.
 
+## 12. Walking into a portal enters it (F2 / F3)
+**Problem:** a portal had to be clicked by hand; with W A S D in the mouse look that means stopping to aim at it.
+**Fix:** near a portal, walking, the crosshair is aimed at its feet; when the game itself reports the portal under
+the pointer, a real click (button down, then up) is sent. Works both ways, does not bounce back through the portal
+you arrived by, and the hero walks on after the teleport. Keys: `[input] portal_auto` (default off),
+`portal_auto_radius`, `portal_auto_delay_ms`.
+
 ---
 
 How each fix works (techniques, measured values, game addresses, files touched) is described in

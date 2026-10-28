@@ -499,10 +499,43 @@ void Refresh(bool active, float heroX, float heroY, float heroZ) {
 
 void HoverWatch();
 
+// [input] portal_auto: while a portal is the target, the crosshair's ray goes through its feet (as for a body) and, once the game's own hover
+// reports that portal, PortalAuto presses the left button. The mouse code's thread reads these, the frame's thread writes them.
+namespace {
+std::atomic<bool> g_force{false}, g_hoverOk{false};
+std::atomic<float> g_forceX{0}, g_forceY{0}, g_forceZ{0};
+std::atomic<int> g_forcedRays{0};
+bool PortalClass(uint32_t cls) { return cls < static_cast<uint32_t>(kObjN) && (kObj[cls] & 7) == 4; }
+}  // namespace
+
 void Adjust(float origin[3], float dir[3], const float px[2], float vpW, float vpH, uintptr_t callerRva) {
     if (g_elev.load(std::memory_order_relaxed)) HoverWatch();   // what the ray before this one found
     const Snap& snap = g_snap[g_published.load(std::memory_order_acquire)];
     const bool centre = AtCentre(px, vpW, vpH);
+    if (centre && g_force.load(std::memory_order_acquire)) {
+        // The hover the game holds now is what the forced ray before this one found: a portal = the click will take it.
+        bool hovered = false;
+        uint32_t type = 0, cls = 0;
+        if (g_forcedRays.fetch_add(1, std::memory_order_relaxed) >= 2 && g_probe && g_probe(&hovered, &type, &cls) && hovered && type == 2 && PortalClass(cls))
+            g_hoverOk.store(true, std::memory_order_release);
+        const float len = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+        if (len > 0.5f) {
+            dir[0] /= len;
+            dir[1] /= len;
+            dir[2] /= len;
+            Cap pc;
+            pc.x = g_forceX.load(std::memory_order_relaxed);
+            pc.y = g_forceY.load(std::memory_order_relaxed);
+            pc.z = g_forceZ.load(std::memory_order_relaxed);
+            if (g_iso.load(std::memory_order_relaxed)) {
+                const float feet[3] = {pc.x + pc.y * kShear, pc.y, pc.z + pc.y * kShear};
+                IsoRay(origin, dir, feet);
+            } else {
+                AimFeet(origin, dir, pc);
+            }
+            return;
+        }
+    }
     if (g_elev.load(std::memory_order_relaxed)) CountCaller(callerRva, centre);
     const bool iso = g_iso.load(std::memory_order_relaxed) && snap.hero;
     if (snap.nBody <= 0 && snap.nObj <= 0 && !iso) return;
@@ -643,6 +676,145 @@ void HoverWatch() {
 }
 
 bool ElevOn() { return g_elev.load(std::memory_order_relaxed); }
+
+// ---- [input] portal_auto -----------------------------------------------------------------------------------------------------------------
+namespace {
+bool (*g_click)(bool down) = nullptr;
+enum class PStage { Idle, Aim, Down };
+PStage g_stage = PStage::Idle;
+ULONGLONG g_stageAt = 0, g_nearSince = 0, g_coolUntil = 0, g_settleUntil = 0;
+bool g_armed = false, g_haveLast = false;
+uint32_t g_lastGen = 0;
+float g_lastX = 0, g_lastZ = 0;
+
+void PortalCancel() {
+    if (g_stage == PStage::Down && g_click) g_click(false);   // a button that went down always comes up
+    g_stage = PStage::Idle;
+    g_force.store(false, std::memory_order_release);
+    g_hoverOk.store(false, std::memory_order_relaxed);
+    g_forcedRays.store(0, std::memory_order_relaxed);
+    g_nearSince = 0;
+}
+
+// The nearest portal (an object of kind 4) to the grid point, with its place; false if none is in the hash.
+bool NearestPortal(float gx, float gz, float* px, float* pz, float* dist, uint32_t* cls) {
+    const uintptr_t table = d2rsig::Addr(kUnits);
+    if (!table) return false;
+    auto read = [](void* d, uintptr_t s, size_t n) { return ReadMem(d, s, n); };
+    float best = 1.0e30f;
+    unitscan::EachUnit(read, table, 2, [&](uintptr_t, const unitscan::Unit& u) {
+        const uint32_t c = unitscan::Field32(u, unitscan::kOffClass);
+        if (!PortalClass(c)) return true;
+        float x, z;
+        if (!ObjectPlace(u, &x, &z)) return true;
+        const float d2 = (x - gx) * (x - gx) + (z - gz) * (z - gz);
+        if (d2 < best) {
+            best = d2;
+            *px = x;
+            *pz = z;
+            *cls = c;
+        }
+        return true;
+    });
+    if (!(best < 1.0e29f)) return false;
+    *dist = sqrtf(best);
+    return true;
+}
+}  // namespace
+
+void SetPortalClick(bool (*fn)(bool down)) { g_click = fn; }
+
+bool PortalForcing() { return g_force.load(std::memory_order_relaxed); }
+
+// Every frame. wanted: flat F2 / F3, mouse look, in the world, no menu, [input] portal_auto on. moving: a move key is held.
+// areaGen: bumps with every area the game loads. The hero's look-at is the render point (see Refresh); the portal's place is on the grid.
+void PortalAuto(bool wanted, bool moving, uint32_t areaGen, float hx, float hy, float hz, float radius, int delayMs) {
+    const ULONGLONG now = GetTickCount64();
+    const bool finite = std::isfinite(hx + hy + hz);
+    const float gx = hx - hy * kShear, gz = hz - hy * kShear;
+    // A new area, or a jump of the hero's place (a teleport inside one): nothing is entered until he has walked away from the portals he stands by.
+    // (He appears next to the portal he came through - entering it again at once would be a bounce.)
+    const bool jumped = g_haveLast && finite && ((gx - g_lastX) * (gx - g_lastX) + (gz - g_lastZ) * (gz - g_lastZ)) > 30.0f * 30.0f;
+    if (areaGen != g_lastGen || jumped) {
+        g_lastGen = areaGen;
+        g_armed = false;
+        PortalCancel();
+        g_coolUntil = now + 1000;
+        g_settleUntil = now + 1500;   // the new area's units are still loading: a portal next to the hero may not be in the hash yet
+    }
+    if (finite) {
+        g_lastX = gx;
+        g_lastZ = gz;
+        g_haveLast = true;
+    } else {
+        g_haveLast = false;
+    }
+    if (!wanted || !finite) {
+        PortalCancel();
+        return;
+    }
+    float px = 0, pz = 0, dist = 0;
+    uint32_t cls = 0;
+    const bool have = NearestPortal(gx, gz, &px, &pz, &dist, &cls);
+    const bool close = have && dist <= radius;
+    if (!g_armed) {
+        if (now < g_settleUntil) {
+            return;
+        }
+        if (!have || dist > radius + 1.5f) {
+            g_armed = true;
+        }
+        return;
+    }
+    switch (g_stage) {
+        case PStage::Idle:
+            if (!close || !moving) {
+                g_nearSince = 0;
+                return;
+            }
+            if (now < g_coolUntil) return;
+            if (!g_nearSince) g_nearSince = now;
+            if (now - g_nearSince < static_cast<ULONGLONG>(delayMs)) return;
+            g_forceX.store(px, std::memory_order_relaxed);
+            g_forceY.store(hy, std::memory_order_relaxed);
+            g_forceZ.store(pz, std::memory_order_relaxed);
+            g_forcedRays.store(0, std::memory_order_relaxed);
+            g_hoverOk.store(false, std::memory_order_relaxed);
+            g_force.store(true, std::memory_order_release);
+            g_stage = PStage::Aim;
+            g_stageAt = now;
+            return;
+        case PStage::Aim:
+            if (!have || dist > radius + 2.0f) {
+                PortalCancel();
+                return;
+            }
+            g_forceX.store(px, std::memory_order_relaxed);
+            g_forceZ.store(pz, std::memory_order_relaxed);
+            if (g_hoverOk.load(std::memory_order_acquire)) {
+                if (!g_click || !g_click(true)) {
+                    PortalCancel();
+                    g_armed = false;
+                    return;
+                }
+                g_stage = PStage::Down;
+                g_stageAt = now;
+                return;
+            }
+            if (now - g_stageAt > 700) {
+                PortalCancel();
+                g_armed = false;
+                g_coolUntil = now + 2000;
+            }
+            return;
+        case PStage::Down:
+            if (now - g_stageAt < 60) return;
+            PortalCancel();   // the button comes up
+            g_armed = false;  // armed again after the walk away, or in the next area
+            g_coolUntil = now + 1500;
+            return;
+    }
+}
 
 bool MonsterPose(uintptr_t unit, float floorY, float* x, float* y, float* z, float* height, uint32_t* cls) {
     if (!unit || !x || !y || !z || !height || !std::isfinite(floorY)) return false;

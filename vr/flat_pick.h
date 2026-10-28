@@ -35,6 +35,13 @@ void LogClick(int type, bool hovered);
 // The probe reads the game's own hover (vrcam: HoverUnit of the local player): false when it cannot, else hovered and the unit's type and class.
 void SetHoverProbe(bool (*fn)(bool* hovered, uint32_t* type, uint32_t* cls));
 
+// [input] portal_auto (flat F2 / F3): walking into a portal enters it. The hero near a portal with a move key held aims the crosshair's ray at the portal's
+// feet; once the game's own hover reports the portal, the left button goes down and, a moment later, up (click(down) -> false: not sent). After a new area
+// (areaGen) nothing is entered until the hero has walked away from the portals he stands by. radius: grid (world) units; delayMs: how long he stays near.
+void SetPortalClick(bool (*click)(bool down));
+void PortalAuto(bool wanted, bool moving, uint32_t areaGen, float hx, float hy, float hz, float radius, int delayMs);
+bool PortalForcing();   // the ray is being forced at a portal: a click then is not a shot at the crosshair
+
 // Live monster/NPC: ground place and MonStats body height (world units).
 // floorY is the feet height (hero ground). false if not a monster or unread.
 // cls (optional): the unit's class, to tell the unit meant from another that took its memory.
