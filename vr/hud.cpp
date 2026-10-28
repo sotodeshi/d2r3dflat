@@ -79,6 +79,7 @@
 #include "hud_globes.h"   // where the game's own life and mana globes are in its interface layer (the wrists' medallions)
 #include "hud_rects.h"    // the toolbar's strip in that layer (the box taken out of the picture), with the cut sliders
 #include "hud_native.h"
+#include "map_arrow.h"   // [hud] map_direction: the arrow on the mini map (flat F2 / F3)
 #include "plate_world.h"   // [hud] monster_bar_room: where the plate stands in the layer (BoxOf)
 
 #include "flatvr_menu_shared.h"   // FlatVR's menu piece, whichever FlatVR header the build sees
@@ -99,6 +100,8 @@ std::atomic<bool> g_menu{false};   // the main menu, or a panel (inventory, trad
 std::atomic<uint64_t> g_layer{0};   // the interface's resource, learnt from its clear
 std::atomic<int> g_mapMode{0};     // [hud] map: 0 in the picture, 1 in its own texture
 std::atomic<int> g_mapCorner{0};   // [hud] map_corner: 0 either top corner, 1 the left one, 2 the right one
+std::atomic<bool> g_arrowOn{false};   // [hud] map_direction (flat F2 / F3): an arrow at the hero's mark on the mini map, where the camera looks
+std::atomic<float> g_arrowDx{0.0f}, g_arrowDz{0.0f};   // ... its heading on the ground grid (vrcam: SetMapArrow)
 std::atomic<bool> g_classic{false};   // the view is from above or behind and the pieces stay in the picture
 std::atomic<float> g_barZoom{1.0f}, g_mapZoom{1.0f};   // [hud] bar_zoom, map_zoom: their size in the picture then
 std::atomic<bool> g_picReady{false};  // the effect that draws them back runs (vrcam's fx)
@@ -137,6 +140,7 @@ std::atomic<bool> g_mapShown{true};
 // with the map off in the game there is nothing to show, and an empty orb is
 // not shown. Under g_lock; cleared by every Publish.
 bool g_mapDrawn = false;
+bool g_arrowBox = false;   // [hud] map_direction: the map's box was seen this frame - the arrow goes on after every run of the interface (the last one is on top)
 std::mutex g_lock;
 // Lists that have the interface bound now: the view they draw it through, and
 // whether the map's draws are being sent to our own target right now.
@@ -586,6 +590,10 @@ bool OnClear(command_list* cl, resource_view rtv, const float c[4], uint32_t, co
     device* dev = cl->get_device();
     if (!IsLayerClear(dev, rtv, c)) return false;
     g_panelRuns.store(0);
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_arrowBox = false;
+    }
     g_frameMap.store(MapNow());
     if (g_frameMap.load() == 1) {   // the frame's interface starts: so does the map's
         const resource_desc d = dev->get_resource_desc(dev->get_resource_from_view(rtv));
@@ -598,7 +606,7 @@ bool OnClear(command_list* cl, resource_view rtv, const float c[4], uint32_t, co
 // On the interface's list: the map's scissor sends the draws to our target, any other back to the layer.
 void OnScissor(command_list* cl, uint32_t, uint32_t count, const rect* rects) {
     const bool redirect = g_frameMap.load() == 1;   // else only seen: the labels keep the map flat
-    if (count == 0 || (!redirect && !g_labels.load())) return;
+    if (count == 0 || (!redirect && !g_labels.load() && !g_arrowOn.load())) return;
     std::lock_guard<std::mutex> g(g_lock);
     auto it = g_drawing.find(cl);
     if (it == g_drawing.end()) return;
@@ -610,10 +618,34 @@ void OnScissor(command_list* cl, uint32_t, uint32_t count, const rect* rects) {
         snprintf(line, sizeof line, "hud: the map's box %d,%d - %d,%d on a %ux%u layer", rects[0].left, rects[0].top, rects[0].right, rects[0].bottom, d.w, d.h);
         Log(line);
     }
-    if (map) { g_mapScissor = rects[0]; g_mapScissorW = d.w; g_mapScissorH = d.h; g_mapDrawn = true; }
+    if (map) { g_mapScissor = rects[0]; g_mapScissorW = d.w; g_mapScissorH = d.h; g_mapDrawn = true; g_arrowBox = true; }
     if (!redirect || !g_mapRtv.handle) return;
     if (map && !d.inMap) { Bind(cl, g_mapRtv); d.inMap = true; }
     else if (!map && d.inMap) { Bind(cl, d.layer); d.inMap = false; }
+}
+
+// [hud] map_direction: the arrow, cut into the layer as rows (a clear of each row's rectangle, opaque amber) at the hero's mark in the map's box (maparrow::MarkOf).
+void DrawMapArrow(command_list* cl, resource_view layerRtv, const rect& box, bool inMapTexture) {
+    float way[2];
+    if (!maparrow::ScreenWay(g_arrowDx.load(), g_arrowDz.load(), way)) return;
+    const maparrow::Box m{box.left, box.top, box.right, box.bottom};
+    maparrow::Box rows[maparrow::kMaxRows];
+    float mx, my;
+    maparrow::MarkOf(m, &mx, &my);
+    const float len = maparrow::LengthFor(m);
+    const int n = maparrow::Rows(mx + way[0] * len * maparrow::kCentroid, my + way[1] * len * maparrow::kCentroid, way, len, m, rows, maparrow::kMaxRows);
+    if (n <= 0) return;
+    rect r[maparrow::kMaxRows];
+    for (int i = 0; i < n; ++i) r[i] = rect{rows[i].left, rows[i].top, rows[i].right, rows[i].bottom};
+    static bool told = false;
+    if (!told) {   // before the first clear: a driver fault in it would leave no line
+        told = true;
+        char line[260];
+        snprintf(line, sizeof line, "hud: map direction - the first arrow, %d rows in the map's box %d,%d - %d,%d, way %.2f,%.2f, in batches of %d, %s; later arrows are not logged", n, box.left, box.top, box.right, box.bottom, way[0], way[1], maparrow::kBatch, inMapTexture ? "into the map's own texture" : "into the layer");
+        Log(line);
+    }
+    static const float kAmber[4] = {1.0f, 0.62f, 0.0f, 0.0f};   // premultiplied, alpha 0: nothing of the world through it
+    for (int i = 0; i < n; i += maparrow::kBatch) cl->clear_render_target_view(inMapTexture ? g_mapRtv : layerRtv, kAmber, (uint32_t)std::min(maparrow::kBatch, n - i), r + i);
 }
 
 // The list leaves the interface for another target: the interface is drawn - empty it.
@@ -628,6 +660,8 @@ void OnBind(command_list* cl, uint32_t count, const resource_view* rtvs, resourc
     auto it = g_drawing.find(cl);
     if (it != g_drawing.end() && it->second.layer.handle != now.handle) {
         const resource_view layerRtv = it->second.layer;
+        if (g_arrowOn.load() && g_arrowBox && g_mapScissorW == it->second.w && g_mapScissorH == it->second.h)
+            DrawMapArrow(cl, layerRtv, g_mapScissor, g_frameMap.load() == 1 && g_mapRtv.handle);
         const int hideNow = HideNow();
         const bool panel = g_panelOut.load();
         {
@@ -715,6 +749,7 @@ void Register() {
 void SetHide(int mode) { g_hide.store(mode); }
 void SetMenuOpen(bool open) { g_menu.store(open); }
 void SetMapMode(int mode) { g_mapMode.store(mode); }
+void SetMapArrow(bool on, float dx, float dz) { g_arrowOn.store(on); g_arrowDx.store(dx); g_arrowDz.store(dz); }
 void SetInterfaceScale(float s) { g_uiScale.store(std::clamp(s, 0.3f, 1.0f)); }
 void SetToolbarCut(float upPct, float downPct, bool tint) {
     g_cutUp.store(hudrects::UpPct(upPct));

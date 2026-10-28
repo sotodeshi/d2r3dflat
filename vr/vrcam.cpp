@@ -105,7 +105,7 @@ namespace uitrace { void Register(bool trace, bool skip, bool depthViaReShade, b
                     bool DepthFixFor(uint64_t layout, uint32_t param); void FixDepthRangeAt(uint8_t* cb); }
 #include "game_hud_shared.h"
 namespace memdiff { void Step(uintptr_t base, const std::wstring& outPath, void (*log)(const char*)); void Reset(void (*log)(const char*)); }
-namespace hud { void Register(); void SetHide(int mode); void SetInterfaceScale(float s); void SetToolbarCut(float upPct, float downPct, bool tint); void SetMenuOpen(bool open); void SetPanelOut(bool out); void PollMenuReader(); bool FlatVrTakesMenu(); void SetMenuPlace(float widthM, float distanceM, float belowM, uint32_t laser, uint32_t window); int FlatVrLaserState(); void SetMapMode(int mode); bool LayerFound(); void SetLogger(void (*log)(const char*)); void SetLook(const FlatVRGameHudLook& look); void SetMapCorner(int corner); bool ToggleMapShown();
+namespace hud { void Register(); void SetHide(int mode); void SetInterfaceScale(float s); void SetToolbarCut(float upPct, float downPct, bool tint); void SetMenuOpen(bool open); void SetPanelOut(bool out); void PollMenuReader(); bool FlatVrTakesMenu(); void SetMenuPlace(float widthM, float distanceM, float belowM, uint32_t laser, uint32_t window); int FlatVrLaserState(); void SetMapMode(int mode); void SetMapArrow(bool on, float dx, float dz); bool LayerFound(); void SetLogger(void (*log)(const char*)); void SetLook(const FlatVRGameHudLook& look); void SetMapCorner(int corner); bool ToggleMapShown();
                 void SetPointer(uint32_t mode); void SetPointerDepth(float base, float tilt, float curve, float topScale); int Anchor(int panel); void SetForearm(int panel, bool valid, const float elbow[3], const float wrist[3], const float across[3]);
                 void SetClassicView(bool on); void SetPictureZoom(float bar, float map); bool PictureWanted(); void SetPictureReady(bool ready);
                 bool PictureNow(int i, float box[4], uint64_t* srv); void SetPictureBarMoved(bool moved); void SetPictureBarOffset(float x, float y); void SetPictureMapMoved(bool moved); void SetPictureMapOffset(float x, float y);
@@ -266,6 +266,7 @@ struct Settings {
     std::atomic<float> modelRadius{1000.0f}; // [render] model_radius: houses, props, units drawn out to this (game: 150)
     std::atomic<int>   renderPoolMb{64};    // [render] render_pool_mb: the game's Renderer Pool at least this big (game: 12)
     std::atomic<int>   entityPoolMb{280};   // [render] entity_pool_mb: its Entity System Pool (game: 70) - cleanroom/pools
+    std::atomic<bool>  hudMapDirection{false};   // [hud] map_direction (flat F2 / F3): an arrow on the mini map where the camera looks
     std::atomic<int>   hudMap{0};           // [hud] map: 0 in the picture, 1 out of it, into its own texture
     // Per view since the Home page (2026-10-05): [hud_top], [hud_third], [hud_floor], [hud_inside]
     // - the Interface tab of each view - falling back to [hud] where unset.
@@ -1605,6 +1606,7 @@ void LoadSettings() {
     }
     g_set.hudMap.store(std::clamp((int)IniF(L"hud", L"map", 0.0f), 0, 1));
     hud::SetMapMode(g_set.hudMap.load());
+    g_set.hudMapDirection.store(IniB(L"hud", L"map_direction", false));
     hud::SetInterfaceScale(GameInterfaceScale());
     // [hud] hide = 1 takes the toolbar's strip out of the game's interface layer: that strip is worked out from the layer's size and Safe Screen Percent and fits the game's art only as
     // far as the 1920 x 1920 picture it was measured on - at the user's 2048 x 2048 (80 %) the horns, the statues' hands and the globes' tops stayed 10 - 55 px over the cut. So the strip
@@ -3342,6 +3344,7 @@ bool LookAtNow(float out[3]) {
 
 // Where a heading (radians, 0 = toward -z, + = left) and a tilt below the
 // horizon (radians) point.
+std::atomic<float> g_mapAheadX{0.0f}, g_mapAheadZ{0.0f};   // [hud] map_direction: the camera's heading on the ground (flat F2 / F3), set by VrViewInner
 V3 Facing(float heading, float down) {
     return {-sinf(heading) * cosf(down), -sinf(down), -cosf(heading) * cosf(down)};
 }
@@ -4099,6 +4102,7 @@ bool VrViewInner(const d2rcam::WorldView& in, float out[16]) {
     const float down = level ? LevelDownDeg() * d2r : std::clamp(down0 + TargetPitch() * d2r, -1.55f, 1.55f);   // + looks further down
     fwd = Facing(heading, down);
     ahead = Facing(heading, 0.0f);
+    g_mapAheadX.store(ahead.x); g_mapAheadZ.store(ahead.z);
     right = {cosf(heading), 0.0f, -sinf(heading)};
     const V3 up0 = d2rcam::m4::Cross(right, fwd);
     const float roll = (level ? LevelRollDeg() : TargetRoll()) * d2r;   // + = the right ear down
@@ -17535,6 +17539,7 @@ DWORD WINAPI UpdateThread(void*) {
         // From above (vrcam off) and from behind the toolbar and the map stay in
         // the picture, at their own size; on the hands only in first person.
         hud::SetClassicView(ClassicNow());
+        hud::SetMapArrow(g_set.platform.load() == 0 && g_set.hudMapDirection.load() && g_enabled.load() && (ThirdPerson() || InsideFree()), g_mapAheadX.load(), g_mapAheadZ.load());   // flat only (CLAUDE.md 4)
         // first person without the body: the map at a size of its own, from its corner
         // ... and on the floor (F3) its own size, depth and place, as the toolbar's
         hud::SetPictureZoom(BarSizeNow(), InsideFree() ? g_set.mapZoomInside.load() : TableView() ? g_set.mapSizeFloor.load() : 1.0f);

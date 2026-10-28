@@ -381,3 +381,32 @@ Files: `vr/vrcam.cpp` (`groundfix`, `camfix::GroundLayers`, `VrFrame` height, in
 `cleanroom/camera/d2rcam.{h,cpp}` (diagnostics: `keep_game_pose`, `cull_scale`, `cull_fov`,
 `cam_fields_log`, `cam_callers_log`), `d2r_vr.ini`. Investigation notes and the ruled-out list:
 `PRZEKAZANIE.md`; diagnostic keys: `INI_ADDED.md`.
+
+## 11. Arrow on the mini map: where the camera looks (flat F2 / F3, 2026-10-28)
+
+D2R VR 0.185 has `[hud] map_direction` (an arrow on the map where you look); the 0.171 base does not. This is a flat-only
+version of it under the same key, written from what the 0.185 binary shows (the setting's name and log lines: an arrow
+cut into the interface layer as rows of pixels), not from its code.
+
+`[hud] map_direction=1` puts an amber arrowhead on the hero's mark in the game's corner map, pointing where the camera
+looks. It runs only with `[mode] platform=0`, in third person (F2) and first person (F3); in VR nothing changes.
+
+How it works: the game draws the interface into one layer, and the map inside a scissor box (`hud.cpp` already knows it).
+When the layer is left for another target, the arrow is cut into it with `clear_render_target_view`: one row of pixels per
+rectangle, premultiplied amber with alpha 0 (nothing of the world shows through). The heading is the camera's ground
+direction (`Facing`, stored by `VrViewInner`), turned into the isometric map's way: a step `(dx, dz)` on the grid is drawn
+`(dx - dz, (dx + dz) / 2)`. The hero's mark is measured at the box's middle, 0.012 of its height up, so it follows the
+layer's size and the interface scale.
+
+Things that were learnt on the way:
+- A hundred rectangles in one clear crashed the NVIDIA driver (`nvwgf2umx.dll`, 0xc0000409) when the map was opened. The
+  arrow is now about 30 rectangles, cleared in batches of 8; the first arrow is logged before it is drawn.
+- In F3 the game draws the map smaller from its corner (`[hud_floor]` map zoom) and the map is then in a texture of its own
+  (`g_mapTex`), not in the layer. The arrow goes into that texture then, so it is scaled with the map; a fixed offset in the
+  layer fitted one view only. The arrowhead is moved by its centre of mass (1/6 of its length), so the mark is in its middle.
+- The game draws the interface in more than one run per frame, and a later run (a building's translucent draw) went over an
+  arrow put after the first one. The arrow is now put when the layer is left after every run, so the last one is on top;
+  with the hero behind a building in the map the arrow stays fully visible.
+
+Files: `vr/map_arrow.h` (pure maths: way, rows, mark; checked by `tools/map_arrow_test.cpp`), `vr/hud.cpp`
+(`DrawMapArrow`, `SetMapArrow`), `vr/vrcam.cpp` (ini key, heading, per-frame call), `d2r_vr.ini`.

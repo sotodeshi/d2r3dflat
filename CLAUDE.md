@@ -8,6 +8,8 @@
    (idzie do autorów moda).
 3. Commity: tylko na polecenie „commit”. Wtedy nowy commit opisujący w tytule/treści
    wprowadzone poprawki. Bez polecenia — żadnych commitów.
+4. Zmiany wprowadzamy tylko dla wersji flat (F1–F3, `[mode] platform=0`). Nie ruszamy
+   ścieżek VR/F4 — nowy kod musi być bramkowany na flat i nie zmieniać zachowania w VR.
 
 Dodatkowo (z `PRZEKAZANIE.md`, które jest pełnym przekazaniem kontekstu — czytaj je):
 
