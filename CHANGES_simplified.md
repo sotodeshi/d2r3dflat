@@ -72,6 +72,12 @@ the pointer, a real click (button down, then up) is sent. Works both ways, does 
 you arrived by, and the hero walks on after the teleport. Keys: `[input] portal_auto` (default off),
 `portal_auto_radius`, `portal_auto_delay_ms`.
 
+## 13. Level look after a portal or waypoint (F3)
+**Problem:** a way portal lies on the ground, so you look down at it, and the hero came out of the teleport still looking down.
+**Fix:** when the hero arrives (his place jumps by over 30 units after the game sets a biome), the pitch of the mouse look returns to
+the horizon; the heading is kept. Walking inside a town or across a biome border does not touch it, and neither does the NPC dialogue
+look. Key: `[input] portal_look_horizon` (default on).
+
 ---
 
 How each fix works (techniques, measured values, game addresses, files touched) is described in

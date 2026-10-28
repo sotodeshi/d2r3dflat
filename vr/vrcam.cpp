@@ -418,6 +418,7 @@ struct Settings {
     std::atomic<int>   portalAutoDelay{150};   // [input] portal_auto_delay_ms: how long he stays that near, walking, before it is entered
     std::atomic<int>   portalFace{1};   // [input] portal_face: the portal's black centre (vr/portal_hole.h), F2/F3 only: 0 the game's, 1 not built, 2 built under an empty name
     std::atomic<bool>  npcLookHorizon{true};  // [input] npc_look_horizon: flat F3, aim look from MonStats height when an NPC's dialogue opens
+    std::atomic<bool>  portalLookHorizon{true}; // [input] portal_look_horizon: flat F3, a new area (a waypoint / portal jump) starts with the look level at the horizon
     std::atomic<float> npcFaceY{0.30f};       // [input] npc_face_y: where the NPC's face is put on the screen then (0 top .. 1 bottom)
     std::atomic<bool>  portalAxis{false};  // [input] portal_axis: effects are born facing the old 45 degree camera; the picture stays
     std::atomic<bool>  findPrevMatrix{false};
@@ -2070,6 +2071,7 @@ void LoadSettings() {
     g_set.portalAutoDelay.store(std::clamp((int)IniF(L"input", L"portal_auto_delay_ms", 150.0f), 0, 2000));
     g_set.portalFace.store(std::clamp((int)IniF(L"input", L"portal_face", 1.0f), 0, 2));
     g_set.npcLookHorizon.store(IniB(L"input", L"npc_look_horizon", true));
+    g_set.portalLookHorizon.store(IniB(L"input", L"portal_look_horizon", true));
     g_set.npcFaceY.store(std::clamp(IniF(L"input", L"npc_face_y", 0.30f), 0.05f, 0.60f));
     // [input] flat_iso_ray: the game's ground test gets the old isometric camera's ray through the point meant (vr/flat_pick.h);
     // [debug] flat_elev: the look-at's frame (grid or render) and the rays' callers in the log. Both need flat_body_pick(_third) on.
@@ -3433,6 +3435,34 @@ void VrFrame() {
             g_gen.fetch_add(1);
         }
         wasNpc = npc;
+    }
+    {   // [input] portal_look_horizon: flat F3, an area was entered (a way portal, a waypoint): the look starts level, not down at the portal's ground.
+        // A dialogue never spans an area change, so the NPC look above is not undone by this.
+        // The game sets a biome again every few seconds while the hero walks (2026-10-28 log), and a new biome name is also what a walk
+        // across a border gives, so neither is a jump. What is: the hero carried over 30 units between two frames (walking is under 1)
+        // after the game set a biome - the set comes when the load starts, the jump when it ends (6-7 s later in the log).
+        static uint32_t seenArea = g_areaGen.load();
+        static ULONGLONG pendingUntil = 0;
+        static float prevLook[3] = {};
+        static bool prevOk = false;
+        const ULONGLONG now = GetTickCount64();
+        if (const uint32_t area = g_areaGen.load(); area != seenArea) {
+            seenArea = area;
+            pendingUntil = now + 20000;
+        }
+        if (haveLook) {
+            const float dx = look[0] - prevLook[0], dz = look[2] - prevLook[2];
+            if (prevOk && now < pendingUntil && dx * dx + dz * dz > 30.0f * 30.0f) {
+                pendingUntil = 0;
+                if (g_set.platform.load() == 0 && g_enabled.load() && InsideFree() && g_set.portalLookHorizon.load() && g_mousePitch.load() != 0.0f) {
+                    g_mousePitch.store(0.0f);
+                    g_gen.fetch_add(1);
+                    LogF("vrcam: flat FPP - hero carried %.0f units, look level at the horizon ([input] portal_look_horizon)", sqrtf(dx * dx + dz * dz));
+                }
+            }
+            memcpy(prevLook, look, sizeof prevLook);
+            prevOk = true;
+        }   // no look-at while an area loads: the last one before it stays the reference
     }
 }
 

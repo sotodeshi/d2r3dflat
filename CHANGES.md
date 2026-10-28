@@ -437,3 +437,26 @@ Safeguards:
 
 Files: `vr/flat_pick.cpp` (`PortalAuto`, `Adjust`), `vr/flat_pick.h`, `vr/vrcam.cpp` (ini keys, `PortalClick`, `VrFrame`
 call, `HookKeyMove`, `HookSetBiome`), `d2r_vr.ini`.
+
+## 13. The look starts level after a portal or waypoint (flat F3, 2026-10-28)
+
+A way portal stands on the ground, so you look down at it, and the hero came out of the teleport still looking down. Now,
+in first person (F3), the mouse look's pitch goes back to the horizon when he arrives. Only the vertical axis; the heading
+is left as it is.
+
+`[input] portal_look_horizon=1` (default on; `0` leaves the pitch alone). Runs only with `[mode] platform=0` in F3; F1, F2,
+F4 and VR are not touched. The NPC dialogue look (`npc_look_horizon`) is not affected: a dialogue never spans an area
+change, and the two set the pitch at different moments.
+
+How the arrival is told (what the first versions got wrong, from the log):
+- The game's `SetCurrentBiome` is called again every 2-3 s while the hero only walks in town, with the same name, so the
+  call alone is no area change (a first version reset the look every few seconds while running).
+- A new biome name is also what a walk across a border gives, so the name is not a signal either: walking from one biome
+  to the next must not touch the look.
+- What is different: the hero is carried. Walking moves his look-at less than 1 unit per frame; a portal or waypoint moves
+  it by thousands. A set of a biome opens a 20 s window (the set comes when the load starts, the jump when it ends, 6-7 s
+  later; a 4 s window missed two of three teleports), and a jump of over 30 units between two frames inside it resets the
+  pitch. The last valid look-at before the load is the reference, as the look-at may be missing while the area loads.
+- Without a biome set in the last 20 s a long jump (the sorceress's Teleport) is not taken for an arrival.
+
+Files: `vr/vrcam.cpp` (ini key, check in `VrFrame` next to the NPC look), `d2r_vr.ini`, `INI_ADDED.md`.
